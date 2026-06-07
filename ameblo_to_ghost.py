@@ -1,0 +1,1523 @@
+#!/usr/bin/env python3
+"""Export public Ameblo posts to a Ghost import JSON file.
+
+The scraper is intentionally conservative: it uses a visible User-Agent,
+waits between requests, keeps a resume file, and starts in dry-run mode.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import hashlib
+import html
+import json
+import random
+import re
+import time
+import unicodedata
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from typing import Iterable
+from urllib.parse import urljoin, urlparse, urlunparse
+
+import requests
+from bs4 import BeautifulSoup, Tag
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+BASE_URL = "https://ameblo.jp/YOUR_AMEBLO_ID/"
+USER_AGENT = (
+    "AmebloToGhostExporter/0.1 "
+    "(personal archive; requests+BeautifulSoup4; contact: local-user)"
+)
+ARTICLE_PATH_RE = re.compile(r"/[^/]+/entry-\d+\.html$")
+THEME_PATH_RE = re.compile(r"/[^/]+/theme-\d+\.html$")
+LISTING_HINT_PATH_RE = re.compile(
+    r"/[^/]+/(?:$|page-\d+\.html|entrylist(?:-\d+)?\.html|"
+    r"theme-\d+\.html|archive[^/]*\.html)"
+)
+IMAGE_EXT_RE = re.compile(r"\.(?:jpe?g|png|gif|webp|svg)(?:$|\?)", re.I)
+GHOST_IMAGE_PREFIX = "/content/images"
+AUTHOR_ID = "REPLACE_WITH_EXISTING_GHOST_AUTHOR_ID"
+AUTHOR_NAME = "Ameblo Author"
+AUTHOR_SLUG = "ameblo-author"
+AUTHOR_EMAIL = "ameblo-author@example.invalid"
+OGP_CARD_CLASSES = {"ogpCard_root", "ogpCard_wrap", "ogpCard_icon", "ogpCard_image"}
+TAG_SLUG_OVERRIDES = {
+    "ゲーム": "game",
+    "大河ドラマ": "taiga-drama",
+    "プログラミング": "programming",
+    "ブログ": "blog",
+}
+
+
+@dataclass
+class ExportConfig:
+    base_url: str
+    output_json: Path
+    image_dir: Path
+    logs_dir: Path
+    fetched_file: Path
+    dry_run: bool
+    limit: int
+    min_delay: float
+    max_delay: float
+    max_listing_pages: int
+    timeout: int
+    download_images: bool
+    refresh: bool
+    remove_feature_image_from_body: bool
+    remove_duplicate_noscript_images: bool
+    debug_title: bool
+    year: int | None
+    month: int | None
+    include_users: bool
+    author_id: str
+    author_name: str
+    author_slug: str
+    author_email: str
+
+
+@dataclass
+class ArticleData:
+    title: str
+    url: str
+    published_at: str | None
+    theme: str | None
+    html: str
+    links: list[str] = field(default_factory=list)
+    images: list[str] = field(default_factory=list)
+    hashtags: list[str] = field(default_factory=list)
+    feature_image: str | None = None
+    slug: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ArticleData":
+        article_html = sanitize_cached_html(normalize_ghost_image_paths(data["html"]))
+        return cls(
+            title=data["title"],
+            url=data["url"],
+            published_at=data.get("published_at"),
+            theme=data.get("theme"),
+            html=article_html,
+            links=list(data.get("links", [])),
+            images=list(data.get("images", [])),
+            hashtags=list(data.get("hashtags", [])),
+            feature_image=normalize_ghost_image_path(
+                data.get("feature_image") or first_image_from_html(article_html)
+            ),
+            slug=data.get("slug", ""),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "title": self.title,
+            "url": self.url,
+            "published_at": self.published_at,
+            "theme": self.theme,
+            "html": self.html,
+            "links": self.links,
+            "images": self.images,
+            "hashtags": self.hashtags,
+            "feature_image": self.feature_image,
+            "slug": self.slug,
+        }
+
+
+class AmebloExporter:
+    def __init__(self, config: ExportConfig) -> None:
+        self.config = config
+        self.session = requests.Session()
+        retry = Retry(
+            total=5,
+            connect=5,
+            read=5,
+            status=5,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET"]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        self.session.headers.update(
+            {
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
+            }
+        )
+        self.errors_path = self.config.logs_dir / "errors.csv"
+        self.images_manifest_path = self.config.output_json.parent / "images_manifest.csv"
+        self.fetched_urls = self._load_fetched_urls()
+        self.article_theme_hints: dict[str, str] = {}
+        self.theme_url_set: set[str] = set()
+        self.config.output_json.parent.mkdir(parents=True, exist_ok=True)
+        self.config.image_dir.mkdir(parents=True, exist_ok=True)
+        self.config.logs_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_error_log()
+        self._ensure_images_manifest()
+
+    def run(self) -> None:
+        article_urls = self.discover_article_urls()
+        if self.config.limit:
+            article_urls = article_urls[: self.config.limit]
+
+        posts: list[ArticleData] = []
+        for index, url in enumerate(article_urls, start=1):
+            cached = None if self.config.refresh else self.fetched_urls.get(url)
+            if cached and cached.get("html"):
+                print(f"[cache] already fetched: {url}")
+                posts.append(ArticleData.from_dict(cached))
+                continue
+            print(f"[post {index}/{len(article_urls)}] {url}")
+            try:
+                article = self.parse_article(url)
+                posts.append(article)
+                self.fetched_urls[url] = article.to_dict()
+                self.fetched_urls[url]["fetched_at"] = datetime.now(timezone.utc).isoformat()
+                self._save_fetched_urls()
+            except Exception as exc:  # noqa: BLE001 - log and continue the export.
+                self.log_error(url, "parse_failed", str(exc))
+            self.sleep()
+
+        ghost_json = self.build_ghost_import(posts)
+        self.config.output_json.write_text(
+            json.dumps(ghost_json, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"[done] wrote {self.config.output_json}")
+
+    def discover_article_urls(self) -> list[str]:
+        if self.config.year:
+            return self.discover_article_urls_by_year()
+
+        queue = [self.config.base_url, urljoin(self.config.base_url, "entrylist.html")]
+        seen_listing: set[str] = set()
+        article_urls: list[str] = []
+        article_seen: set[str] = set()
+
+        while queue and len(seen_listing) < self.config.max_listing_pages:
+            listing_url = normalize_url(queue.pop(0))
+            if listing_url in seen_listing:
+                continue
+            if (
+                self.config.dry_run
+                and len(article_urls) >= self.config.limit
+                and not self.is_known_theme_url(listing_url)
+                and listing_url != urljoin(self.config.base_url, "entrylist.html")
+            ):
+                continue
+            seen_listing.add(listing_url)
+            print(f"[list] {listing_url}")
+            try:
+                soup = self.fetch_soup(listing_url)
+            except Exception as exc:  # noqa: BLE001
+                self.log_error(listing_url, "listing_fetch_failed", str(exc))
+                continue
+
+            listing_theme = self.extract_listing_theme(soup, listing_url)
+            for href in self.extract_hrefs(soup, listing_url):
+                normalized = normalize_url(href)
+                if not is_same_blog_url(normalized, self.config.base_url):
+                    continue
+                path = urlparse(normalized).path
+                if is_article_path(path, self.config.base_url):
+                    normalized = canonical_article_url(normalized)
+                    if listing_theme:
+                        self.article_theme_hints.setdefault(normalized, listing_theme)
+                    if normalized not in article_seen:
+                        article_seen.add(normalized)
+                        article_urls.append(normalized)
+                elif is_listing_hint_path(path, self.config.base_url) and normalized not in seen_listing:
+                    if is_numeric_theme_url(normalized):
+                        self.theme_url_set.add(normalized)
+                    if normalized not in queue:
+                        queue.append(normalized)
+            if self.config.dry_run and len(article_urls) >= self.config.limit:
+                entrylist_url = urljoin(self.config.base_url, "entrylist.html")
+                if entrylist_url not in seen_listing:
+                    self.sleep()
+                    continue
+                target_urls = article_urls[: self.config.limit]
+                missing_themes = [url for url in target_urls if url not in self.article_theme_hints]
+                has_theme_pages = any(self.is_known_theme_url(item) for item in queue)
+                if not missing_themes or not has_theme_pages:
+                    return target_urls
+            self.sleep()
+
+        return article_urls
+
+    def discover_article_urls_by_year(self) -> list[str]:
+        months = [self.config.month] if self.config.month else list(range(12, 0, -1))
+        queue = [
+            urljoin(self.config.base_url, f"archive-{self.config.year}{month:02d}.html")
+            for month in months
+        ]
+        seen_listing: set[str] = set()
+        article_urls: list[str] = []
+        article_seen: set[str] = set()
+
+        while queue and len(seen_listing) < self.config.max_listing_pages:
+            listing_url = normalize_url(queue.pop(0))
+            if listing_url in seen_listing:
+                continue
+            seen_listing.add(listing_url)
+            print(f"[list] {listing_url}")
+            try:
+                soup = self.fetch_soup(listing_url)
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code == 404:
+                    continue
+                self.log_error(listing_url, "listing_fetch_failed", str(exc))
+                continue
+            except Exception as exc:  # noqa: BLE001
+                self.log_error(listing_url, "listing_fetch_failed", str(exc))
+                continue
+
+            for href in self.extract_hrefs(soup, listing_url):
+                normalized = normalize_url(href)
+                if not is_same_blog_url(normalized, self.config.base_url):
+                    continue
+                path = urlparse(normalized).path
+                if is_article_path(path, self.config.base_url):
+                    normalized = canonical_article_url(normalized)
+                    if normalized not in article_seen:
+                        article_seen.add(normalized)
+                        article_urls.append(normalized)
+                        if self.config.limit and len(article_urls) >= self.config.limit:
+                            self.discover_theme_urls_from_index()
+                            self.populate_theme_hints_for_targets(article_urls)
+                            return article_urls
+                elif is_numeric_theme_url(normalized):
+                    self.theme_url_set.add(normalized)
+                elif self.is_same_year_archive_url(normalized) and normalized not in seen_listing:
+                    if normalized not in queue:
+                        queue.append(normalized)
+            self.sleep()
+
+        self.discover_theme_urls_from_index()
+        self.populate_theme_hints_for_targets(article_urls)
+        return article_urls
+
+    def discover_theme_urls_from_index(self) -> None:
+        for listing_url in [self.config.base_url, urljoin(self.config.base_url, "entrylist.html")]:
+            try:
+                soup = self.fetch_soup(listing_url)
+            except Exception as exc:  # noqa: BLE001
+                self.log_error(listing_url, "theme_index_fetch_failed", str(exc))
+                continue
+            for href in self.extract_hrefs(soup, listing_url):
+                normalized = normalize_url(href)
+                if is_same_blog_url(normalized, self.config.base_url) and is_numeric_theme_url(normalized):
+                    self.theme_url_set.add(normalized)
+            self.sleep()
+
+    def is_same_year_archive_url(self, url: str) -> bool:
+        path = urlparse(url).path
+        blog_id = re.escape(blog_id_from_base_url(self.config.base_url) or "")
+        if self.config.month:
+            pattern = rf"/{blog_id}/archive-{self.config.year}{self.config.month:02d}(?:-\d+)?\.html$"
+        else:
+            pattern = rf"/{blog_id}/archive-{self.config.year}\d{{2}}(?:-\d+)?\.html$"
+        return bool(re.search(pattern, path))
+
+    def populate_theme_hints_for_targets(self, article_urls: list[str]) -> None:
+        missing = {url for url in article_urls if url not in self.article_theme_hints}
+        if not missing:
+            return
+        theme_queue = list(self.theme_url_set)
+        seen_theme: set[str] = set()
+        while theme_queue and missing and len(seen_theme) < self.config.max_listing_pages:
+            theme_url = normalize_url(theme_queue.pop(0))
+            if theme_url in seen_theme or not self.is_known_theme_url(theme_url):
+                continue
+            seen_theme.add(theme_url)
+            print(f"[list] {theme_url}")
+            try:
+                soup = self.fetch_soup(theme_url)
+            except Exception as exc:  # noqa: BLE001
+                self.log_error(theme_url, "theme_fetch_failed", str(exc))
+                continue
+            listing_theme = self.extract_listing_theme(soup, theme_url)
+            for href in self.extract_hrefs(soup, theme_url):
+                normalized = normalize_url(href)
+                if not is_same_blog_url(normalized, self.config.base_url):
+                    continue
+                path = urlparse(normalized).path
+                if is_article_path(path, self.config.base_url):
+                    article_url = canonical_article_url(normalized)
+                    if listing_theme and article_url in missing:
+                        self.article_theme_hints.setdefault(article_url, listing_theme)
+                        missing.discard(article_url)
+                elif is_numeric_theme_url(normalized):
+                    self.theme_url_set.add(normalized)
+                    if normalized not in seen_theme and normalized not in theme_queue:
+                        theme_queue.append(normalized)
+                elif self.is_theme_pagination_url(normalized, theme_url):
+                    self.theme_url_set.add(normalized)
+                    if normalized not in seen_theme and normalized not in theme_queue:
+                        theme_queue.append(normalized)
+            self.sleep()
+
+    def is_theme_pagination_url(self, url: str, theme_url: str) -> bool:
+        theme_path = urlparse(theme_url).path
+        match = re.search(r"(theme-\d+)\.html$", theme_path)
+        if not match:
+            return False
+        blog_id = re.escape(blog_id_from_base_url(self.config.base_url) or "")
+        return bool(re.search(rf"/{blog_id}/{match.group(1)}(?:-\d+)?\.html$", urlparse(url).path))
+
+    def parse_article(self, url: str) -> ArticleData:
+        soup = self.fetch_soup(url)
+        title = self.extract_title(soup, url)
+        published_at = self.extract_published_at(soup)
+        theme = self.extract_theme(soup)
+        if not theme:
+            theme = self.article_theme_hints.get(url)
+        body = self.extract_body(soup)
+        remove_image_card_blocks(body)
+        api_hashtags = self.fetch_hashtags_from_api(url)
+        hashtags = merge_unique(api_hashtags, self.extract_hashtags(soup))
+        if theme:
+            hashtags = [hashtag for hashtag in hashtags if hashtag != theme]
+
+        links = sorted(set(self.extract_hrefs(body, url)))
+        image_urls = sorted(set(self.extract_image_urls(body, url)))
+        if self.config.download_images:
+            self.rewrite_and_download_images(body, image_urls, published_at, url)
+        if self.config.remove_duplicate_noscript_images:
+            remove_duplicate_noscript_images(body)
+
+        feature_image_node = find_feature_image_tag(body)
+        feature_image = image_src(feature_image_node)
+        append_source_link(body, url)
+        body_html = str(body)
+        if self.config.remove_duplicate_noscript_images:
+            if body.find("noscript"):
+                message = "noscript remains in body html"
+                self.log_error(url, "noscript_remains_in_body", message)
+                raise ValueError(message)
+        slug = make_slug(url=url, title=title, published_at=published_at)
+        return ArticleData(
+            title=title,
+            url=url,
+            published_at=published_at,
+            theme=theme,
+            html=body_html,
+            links=links,
+            images=image_urls,
+            hashtags=hashtags,
+            feature_image=feature_image,
+            slug=slug,
+        )
+
+    def fetch_soup(self, url: str) -> BeautifulSoup:
+        response = self.session.get(url, timeout=self.config.timeout)
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or response.encoding
+        return BeautifulSoup(response.text, "lxml")
+
+    def sleep(self) -> None:
+        delay = random.uniform(self.config.min_delay, self.config.max_delay)
+        time.sleep(delay)
+
+    @staticmethod
+    def extract_hrefs(soup: BeautifulSoup | Tag, base_url: str) -> list[str]:
+        urls: list[str] = []
+        for anchor in soup.find_all("a", href=True):
+            href = anchor.get("href", "").strip()
+            if href and not href.startswith(("#", "javascript:", "mailto:")):
+                urls.append(urljoin(base_url, href))
+        return urls
+
+    @staticmethod
+    def extract_image_urls(soup: BeautifulSoup | Tag, base_url: str) -> list[str]:
+        urls: list[str] = []
+        for img in soup.find_all("img"):
+            src = img.get("src") or img.get("data-src") or img.get("data-original")
+            if src:
+                urls.append(urljoin(base_url, src.strip()))
+        return urls
+
+    def extract_title(self, soup: BeautifulSoup, url: str = "") -> str:
+        candidates = collect_title_candidates(soup)
+        if candidates:
+            selected = select_best_title(candidates)
+            if self.config.debug_title:
+                print(f"[debug-title] {url}")
+                for source, value in candidates:
+                    marker = "*" if value == selected else " "
+                    print(f"[debug-title] {marker} {source}: {value}")
+            return selected
+        raise ValueError("title not found")
+
+    @staticmethod
+    def extract_published_at(soup: BeautifulSoup) -> str | None:
+        json_ld = find_blogposting_json_ld(soup)
+        if json_ld:
+            for key in ("datePublished", "dateModified"):
+                parsed = parse_datetime(str(json_ld.get(key, "")))
+                if parsed:
+                    return parsed
+
+        meta_names = [
+            ("property", "article:published_time"),
+            ("property", "og:updated_time"),
+            ("name", "pubdate"),
+        ]
+        for attr, value in meta_names:
+            meta = soup.find("meta", attrs={attr: value})
+            if meta and meta.get("content"):
+                parsed = parse_datetime(meta["content"])
+                if parsed:
+                    return parsed
+
+        for time_tag in soup.find_all("time"):
+            value = time_tag.get("datetime") or time_tag.get_text(" ", strip=True)
+            parsed = parse_datetime(value)
+            if parsed:
+                return parsed
+
+        text = soup.get_text("\n", strip=True)
+        match = re.search(
+            r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日.*?(\d{1,2})時\s*(\d{1,2})分",
+            text,
+        )
+        if match:
+            year, month, day, hour, minute = map(int, match.groups())
+            return datetime(year, month, day, hour, minute).isoformat()
+        return None
+
+    def extract_theme(self, soup: BeautifulSoup) -> str | None:
+        for anchor in soup.find_all("a", href=True):
+            href = anchor.get("href", "")
+            if is_numeric_theme_url(urljoin(self.config.base_url, href)):
+                value = clean_theme_name(anchor.get_text(" ", strip=True))
+                if value:
+                    return value
+        text = soup.get_text("\n", strip=True)
+        match = re.search(r"テーマ[:：]\s*([^\n]+)", text)
+        return clean_theme_name(match.group(1)) if match else None
+
+    def extract_listing_theme(self, soup: BeautifulSoup, listing_url: str = "") -> str | None:
+        if not self.is_known_theme_url(listing_url):
+            return None
+        for heading in soup.find_all(["h1", "h2"]):
+            value = clean_text(heading.get_text(" ", strip=True))
+            match = re.match(r"(.+?)\s*の記事\(", value)
+            if match:
+                return clean_theme_name(match.group(1))
+        return None
+
+    def is_known_theme_url(self, url: str) -> bool:
+        normalized = normalize_url(url)
+        return normalized in self.theme_url_set or is_numeric_theme_url(normalized)
+
+    @staticmethod
+    def extract_hashtags(soup: BeautifulSoup) -> list[str]:
+        values: list[str] = []
+
+        for anchor in soup.find_all("a", href=True):
+            href = anchor.get("href", "")
+            text = anchor.get_text(" ", strip=True)
+            if "hashtag" in href or "/tags/" in href:
+                add_hashtag(values, text)
+            elif text.startswith("#"):
+                add_hashtag(values, text)
+
+        source = str(soup)
+        for match in re.finditer(r'"hash_tag_list"\s*:\s*(\[[^\]]*\])', source):
+            try:
+                items = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+            for item in items:
+                if isinstance(item, str):
+                    add_hashtag(values, item)
+                elif isinstance(item, dict):
+                    for key in ("name", "tag_name", "hashtag_name", "hash_tag_name", "text"):
+                        if item.get(key):
+                            add_hashtag(values, str(item[key]))
+                            break
+
+        return list(dict.fromkeys(values))
+
+    def fetch_hashtags_from_api(self, article_url: str) -> list[str]:
+        blog_id = blog_id_from_base_url(self.config.base_url)
+        article_id = article_id_from_url(article_url)
+        if not blog_id or not article_id:
+            return []
+        api_url = f"https://rapi.blogtag.ameba.jp/hashtag/api/v2/article/tag/{blog_id}/{article_id}"
+        try:
+            response = self.session.get(
+                api_url,
+                timeout=self.config.timeout,
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            items = response.json()
+        except Exception as exc:  # noqa: BLE001
+            self.log_error(article_url, "hashtag_fetch_failed", str(exc))
+            return []
+
+        values: list[str] = []
+        if not isinstance(items, list):
+            self.log_error(article_url, "hashtag_fetch_failed", "unexpected response shape")
+            return values
+        for item in items:
+            if isinstance(item, dict) and item.get("hashtag"):
+                add_hashtag(values, str(item["hashtag"]))
+        return list(dict.fromkeys(values))
+
+    @staticmethod
+    def extract_body(soup: BeautifulSoup) -> Tag:
+        selectors = [
+            "#entryBody",
+            ".articleText",
+            "[data-uranus-component='entryBody']",
+            ".skin-entryBody",
+            ".entryBody",
+            ".entry-body",
+        ]
+        for selector in selectors:
+            node = soup.select_one(selector)
+            if node and len(node.get_text(strip=True)) > 20:
+                remove_article_chrome(node)
+                return node
+
+        wrapper = soup.select_one(".js-entryWrapper, .skinArticle")
+        if wrapper:
+            clone = copy.deepcopy(wrapper)
+            remove_article_chrome(clone)
+            if len(clone.get_text(strip=True)) > 20:
+                return clone
+        raise ValueError("body not found")
+
+    def rewrite_and_download_images(
+        self, body: Tag, image_urls: Iterable[str], published_at: str | None, article_url: str
+    ) -> None:
+        url_map: dict[str, str] = {}
+        for image_url in image_urls:
+            try:
+                ghost_path, local_path = self.download_image(image_url, published_at)
+                url_map[image_url] = ghost_path
+                self.log_image_manifest(image_url, local_path, article_url, "ok", "")
+            except Exception as exc:  # noqa: BLE001
+                self.log_error(image_url, "image_download_failed", str(exc))
+                self.log_image_manifest(image_url, "", article_url, "failed", str(exc))
+
+        for img in body.find_all("img"):
+            src = img.get("src") or img.get("data-src") or img.get("data-original")
+            if not src:
+                continue
+            absolute = urljoin(self.config.base_url, src)
+            if absolute in url_map:
+                img["src"] = url_map[absolute]
+                for attr in ("data-src", "data-original", "srcset", "data-srcset"):
+                    if attr in img.attrs:
+                        del img.attrs[attr]
+
+    def download_image(self, image_url: str, published_at: str | None) -> tuple[str, str]:
+        parsed_date = datetime.now()
+        if published_at:
+            try:
+                parsed_date = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+
+        relative_dir = Path("content") / "images" / f"{parsed_date:%Y}" / f"{parsed_date:%m}"
+        target_dir = self.config.image_dir / f"{parsed_date:%Y}" / f"{parsed_date:%m}"
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        parsed = urlparse(image_url)
+        suffix = Path(parsed.path).suffix
+        if not suffix or not IMAGE_EXT_RE.search(suffix):
+            suffix = ".jpg"
+        digest = hashlib.sha1(image_url.encode("utf-8")).hexdigest()[:12]
+        filename = f"{digest}{suffix.lower()}"
+        target = target_dir / filename
+        ghost_path = f"{GHOST_IMAGE_PREFIX}/{parsed_date:%Y}/{parsed_date:%m}/{filename}"
+        local_path = (relative_dir / filename).as_posix()
+        if target.exists():
+            return ghost_path, local_path
+
+        response = self.session.get(image_url, timeout=self.config.timeout)
+        response.raise_for_status()
+        target.write_bytes(response.content)
+        return ghost_path, local_path
+
+    def build_ghost_import(self, articles: list[ArticleData]) -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        author_id = self.config.author_id
+        users = [
+            {
+                "id": author_id,
+                "name": self.config.author_name,
+                "slug": self.config.author_slug,
+                "email": self.config.author_email,
+                "profile_image": None,
+                "cover_image": None,
+                "bio": None,
+                "website": None,
+                "location": None,
+                "facebook": None,
+                "twitter": None,
+                "accessibility": None,
+                "status": "active",
+                "meta_title": None,
+                "meta_description": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        ]
+        tags_by_name: dict[str, str] = {}
+        posts: list[dict] = []
+        tags: list[dict] = []
+        posts_tags: list[dict] = []
+        posts_authors: list[dict] = []
+
+        def ensure_tag(name: str, description: str) -> str:
+            if name not in tags_by_name:
+                tag_id = uuid.uuid4().hex
+                tags_by_name[name] = tag_id
+                tags.append(
+                    {
+                        "id": tag_id,
+                        "name": name,
+                        "slug": stable_tag_slug(name),
+                        "description": description,
+                    }
+                )
+            return tags_by_name[name]
+
+        for article in articles:
+            post_id = uuid.uuid4().hex
+            published_at = article.published_at or now
+            posts.append(
+                {
+                    "id": post_id,
+                    "title": article.title,
+                    "slug": article.slug,
+                    "html": article.html,
+                    "feature_image": normalize_ghost_image_path(article.feature_image),
+                    "status": "published",
+                    "visibility": "public",
+                    "primary_author_id": author_id,
+                    "published_at": published_at,
+                    "created_at": published_at,
+                    "updated_at": now,
+                    "custom_excerpt": article.theme or "",
+                    "meta_title": article.title,
+                    "meta_description": "",
+                    "canonical_url": article.url,
+                }
+            )
+            posts_authors.append({"post_id": post_id, "author_id": author_id, "sort_order": 0})
+            tag_names: list[tuple[str, str]] = []
+            if article.theme:
+                tag_names.append((article.theme, "Imported from Ameblo theme"))
+            for hashtag in article.hashtags:
+                if hashtag != article.theme:
+                    tag_names.append((hashtag, "Imported from Ameblo hashtag"))
+
+            for sort_order, (tag_name, description) in enumerate(tag_names):
+                tag_id = ensure_tag(tag_name, description)
+                posts_tags.append(
+                    {"post_id": post_id, "tag_id": tag_id, "sort_order": sort_order}
+                )
+
+        data = {
+            "posts": posts,
+            "tags": tags,
+            "posts_tags": posts_tags,
+            "posts_authors": posts_authors,
+        }
+        if self.config.include_users:
+            data["users"] = users
+
+        return {
+            "db": [
+                {
+                    "meta": {
+                        "exported_on": int(time.time() * 1000),
+                        "version": "5.0.0",
+                    },
+                    "data": data,
+                }
+            ]
+        }
+
+    def _load_fetched_urls(self) -> dict:
+        if self.config.fetched_file.exists():
+            return json.loads(self.config.fetched_file.read_text(encoding="utf-8"))
+        return {}
+
+    def _save_fetched_urls(self) -> None:
+        self.config.fetched_file.write_text(
+            json.dumps(self.fetched_urls, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def _ensure_error_log(self) -> None:
+        if self.errors_path.exists():
+            return
+        with self.errors_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["timestamp", "url", "kind", "message"])
+
+    def _ensure_images_manifest(self) -> None:
+        if self.images_manifest_path.exists():
+            return
+        with self.images_manifest_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["timestamp", "article_url", "original_url", "local_path", "status", "message"])
+
+    def log_error(self, url: str, kind: str, message: str) -> None:
+        with self.errors_path.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([datetime.now(timezone.utc).isoformat(), url, kind, message])
+
+    def log_image_manifest(
+        self, original_url: str, local_path: str, article_url: str, status: str, message: str
+    ) -> None:
+        with self.images_manifest_path.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                [
+                    datetime.now(timezone.utc).isoformat(),
+                    article_url,
+                    original_url,
+                    local_path,
+                    status,
+                    message,
+                ]
+            )
+
+
+def normalize_url(url: str) -> str:
+    parsed = urlparse(url)
+    parsed = parsed._replace(fragment="")
+    path = parsed.path or "/"
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", parsed.query, ""))
+
+
+def canonical_article_url(url: str) -> str:
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
+def is_article_path(path: str, base_url: str) -> bool:
+    blog_id = re.escape(blog_id_from_base_url(base_url) or "")
+    return bool(blog_id and re.search(rf"/{blog_id}/entry-\d+\.html$", path))
+
+
+def is_listing_hint_path(path: str, base_url: str) -> bool:
+    blog_id = re.escape(blog_id_from_base_url(base_url) or "")
+    return bool(
+        blog_id
+        and re.search(
+            rf"/{blog_id}/(?:$|page-\d+\.html|entrylist(?:-\d+)?\.html|"
+            rf"theme-\d+\.html|archive[^/]*\.html)",
+            path,
+        )
+    )
+
+
+def blog_id_from_base_url(base_url: str) -> str | None:
+    path = urlparse(base_url).path.strip("/")
+    return path.split("/", 1)[0] if path else None
+
+
+def article_id_from_url(url: str) -> str | None:
+    match = re.search(r"/entry-(\d+)\.html$", urlparse(url).path)
+    return match.group(1) if match else None
+
+
+def merge_unique(*groups: Iterable[str]) -> list[str]:
+    values: list[str] = []
+    for group in groups:
+        for value in group:
+            cleaned = clean_text(str(value).lstrip("#"))
+            if cleaned and cleaned not in values:
+                values.append(cleaned)
+    return values
+
+
+def is_numeric_theme_url(url: str) -> bool:
+    return bool(THEME_PATH_RE.search(urlparse(url).path))
+
+
+def is_same_blog_url(url: str, base_url: str) -> bool:
+    parsed = urlparse(url)
+    base = urlparse(base_url)
+    return parsed.netloc == base.netloc and parsed.path.startswith(base.path.rstrip("/") + "/")
+
+
+def clean_text(value: str) -> str:
+    return html.unescape(re.sub(r"\s+", " ", value)).strip()
+
+
+def strip_title_wrappers(value: str) -> str:
+    value = clean_text(value)
+    if value.startswith("『") and value.endswith("』"):
+        return value[1:-1].strip()
+    return value
+
+
+def title_text_from_tag(tag: Tag) -> str:
+    clone = copy.deepcopy(tag)
+    for node in clone.find_all(["svg", "path"]):
+        node.decompose()
+    for node in clone.find_all(attrs={"aria-label": "リブログ記事"}):
+        node.decompose()
+    for span in clone.find_all("span"):
+        classes = " ".join(span.get("class", []))
+        aria = span.get("aria-label", "")
+        if "icon" in classes.lower() or aria == "リブログ記事":
+            span.decompose()
+    return clone.get_text(" ", strip=True)
+
+
+def collect_title_candidates(soup: BeautifulSoup) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+
+    selector_sources = [
+        ("skinArticleTitle", ".skinArticleTitle"),
+        ("skin-entryTitle", ".skin-entryTitle"),
+        ("uranus-entryTitle", "[data-uranus-component='entryTitle']"),
+        ("entry-title", ".entry-title"),
+    ]
+    for source, selector in selector_sources:
+        for node in soup.select(selector):
+            add_title_candidate(candidates, source, title_text_from_tag(node))
+
+    meta = soup.find("meta", property="og:title")
+    if meta:
+        add_title_candidate(candidates, "og:title", str(meta.get("content", "")))
+
+    json_ld = find_blogposting_json_ld(soup)
+    if json_ld and json_ld.get("headline"):
+        add_title_candidate(candidates, "jsonld:headline", str(json_ld["headline"]))
+
+    for heading in soup.find_all("h1"):
+        classes = set(heading.get("class", []))
+        if "skinTitleArea" in classes:
+            continue
+        add_title_candidate(candidates, "h1", title_text_from_tag(heading))
+
+    if soup.title:
+        title_value = clean_text(soup.title.get_text(" ", strip=True)).split("|", 1)[0]
+        add_title_candidate(candidates, "soup.title", title_value)
+
+    return candidates
+
+
+def add_title_candidate(candidates: list[tuple[str, str]], source: str, value: str) -> None:
+    value = strip_title_wrappers(value)
+    if not value:
+        return
+    if value in {candidate for _, candidate in candidates}:
+        return
+    candidates.append((source, value))
+
+
+def select_best_title(candidates: list[tuple[str, str]]) -> str:
+    values = [value for _, value in candidates]
+    non_substrings = [
+        value
+        for value in values
+        if not any(value != other and normalized_title_contains(other, value) for other in values)
+    ]
+    pool = non_substrings or values
+    return max(pool, key=title_score)
+
+
+def normalized_title_contains(container: str, part: str) -> bool:
+    container_norm = normalize_title_for_compare(container)
+    part_norm = normalize_title_for_compare(part)
+    return bool(part_norm) and part_norm in container_norm
+
+
+def normalize_title_for_compare(value: str) -> str:
+    return re.sub(r"\s+", "", clean_text(value)).lower()
+
+
+def cjk_internal_space_count(value: str) -> int:
+    cjk = r"\u3040-\u30ff\u3400-\u9fff"
+    return len(re.findall(rf"(?<=[{cjk}])\s+(?=[{cjk}])", value))
+
+
+def title_score(value: str) -> tuple[int, int, int, int]:
+    # Prefer titles with more meaningful punctuation/series markers, then length.
+    marker_count = len(re.findall(r"[【】（）()「」『』]|その\d+", value))
+    non_ascii_count = sum(1 for char in value if ord(char) > 127)
+    return (marker_count, -cjk_internal_space_count(value), len(value), non_ascii_count)
+
+
+def clean_theme_name(value: str) -> str | None:
+    value = re.sub(r"\(\d+\)$", "", clean_text(value)).strip()
+    blocked = {
+        "テーマ",
+        "テーマ別記事一覧",
+        "ブログトップ",
+        "記事一覧",
+        "画像一覧",
+    }
+    return value if value and value not in blocked else None
+
+
+def clean_hashtag_name(value: str) -> str | None:
+    value = clean_text(value).lstrip("#").strip()
+    value = re.sub(r"\(\d+\)$", "", value).strip()
+    blocked = {"ハッシュタグ", "hashtag", "タグ"}
+    return value if value and value.lower() not in blocked else None
+
+
+def add_hashtag(values: list[str], value: str) -> None:
+    cleaned = clean_hashtag_name(value)
+    if cleaned and cleaned not in values:
+        values.append(cleaned)
+
+
+def append_source_link(body: Tag, article_url: str) -> None:
+    fragment = BeautifulSoup(
+        (
+            "<hr>"
+            "<p>元記事: "
+            f'<a href="{html.escape(article_url, quote=True)}">'
+            f"{html.escape(article_url)}"
+            "</a></p>"
+        ),
+        "lxml",
+    )
+    nodes = fragment.body.contents if fragment.body else fragment.contents
+    for node in list(nodes):
+        body.append(node)
+
+
+def remove_image_card_blocks(body: Tag) -> None:
+    for node in body.find_all(class_=lambda value: class_list_contains(value, OGP_CARD_CLASSES)):
+        node.decompose()
+
+    card_class_patterns = (
+        "kg-card",
+        "kg-image-card",
+        "image-card",
+        "ghost-image-card",
+    )
+    for node in body.find_all(class_=True):
+        classes = " ".join(node.get("class", [])).lower()
+        if any(pattern in classes for pattern in card_class_patterns):
+            node.decompose()
+
+    for attr in ("data-lexical-image", "data-mobiledoc-card", "data-kg-card"):
+        for node in body.find_all(attrs={attr: True}):
+            node.decompose()
+
+
+def remove_article_chrome(body: Tag) -> None:
+    chrome_selectors = [
+        ".skinArticleHeader",
+        ".skinArticleTitle",
+        ".skinArticleFooter",
+        ".articleHeader",
+        ".articleFooter",
+        ".entryHeader",
+        ".entryFooter",
+        ".js-entryHeader",
+        ".js-entryFooter",
+        ".skinArticleRelation",
+        ".skinArticleRanking",
+        ".skinArticleAd",
+        ".ad",
+        ".ads",
+        ".ranking",
+        ".related",
+    ]
+    for selector in chrome_selectors:
+        for node in body.select(selector):
+            node.decompose()
+
+    for heading in body.find_all("h1"):
+        heading.decompose()
+
+
+def remove_duplicate_noscript_images(body: Tag) -> None:
+    for noscript in list(body.find_all("noscript")):
+        noscript.decompose()
+    prune_empty_containers(body)
+
+
+def remove_first_matching_image(body: Tag, feature_image: str) -> None:
+    remove_matching_images(body, feature_image, first_only=True)
+
+
+def remove_matching_images(body: Tag, feature_image: str, first_only: bool = False) -> None:
+    normalized_feature = normalize_image_url(feature_image)
+    removed_any = remove_matching_url_nodes(body, normalized_feature, first_only)
+    if removed_any:
+        prune_empty_containers(body)
+
+
+def remove_matching_url_nodes(body: Tag, normalized_feature: str, first_only: bool) -> bool:
+    removed_any = False
+    while True:
+        target = find_matching_url_node(body, normalized_feature)
+        if not target:
+            return removed_any
+        remove_url_node_with_context(target)
+        removed_any = True
+        if first_only:
+            return removed_any
+
+
+def find_matching_url_node(body: Tag, normalized_feature: str) -> Tag | None:
+    for image in list(body.find_all("img")):
+        for attr in ("src", "data-src"):
+            if normalize_image_url(str(image.get(attr) or "")) == normalized_feature:
+                return image
+
+    for noscript in list(body.find_all("noscript")):
+        if any(normalize_image_url(url) == normalized_feature for url in urls_from_noscript(noscript)):
+            return noscript
+
+    for anchor in list(body.find_all("a", href=True)):
+        if normalize_image_url(str(anchor.get("href") or "")) == normalized_feature:
+            return anchor
+
+    for source in list(body.find_all("source")):
+        for url in urls_from_srcset(str(source.get("srcset") or "")):
+            if normalize_image_url(url) == normalized_feature:
+                return source
+    return None
+
+
+def remove_url_node_with_context(node: Tag) -> None:
+    if node.name == "img":
+        remove_image_with_context(node)
+        return
+    if node.name == "noscript":
+        remove_media_container_with_context(node)
+        return
+    if node.name == "source":
+        picture = node.find_parent("picture")
+        if picture:
+            remove_media_container_with_context(picture)
+            return
+        node.decompose()
+        return
+    if node.name == "a":
+        remove_media_container_with_context(node)
+        return
+    node.decompose()
+
+
+def remove_image_with_context(image: Tag) -> None:
+    remove_media_container_with_context(image)
+
+
+def remove_media_container_with_context(node: Tag) -> None:
+    removable = image_only_ancestor(node) or node
+    removable.decompose()
+
+
+def image_only_ancestor(node: Tag) -> Tag | None:
+    for tag_name in ("p", "figure", "div", "a", "noscript"):
+        ancestor = node.find_parent(tag_name)
+        if ancestor and contains_only_image_links(ancestor):
+            return ancestor
+    if node.name in {"p", "figure", "div", "a", "noscript"} and contains_only_image_links(node):
+        return node
+    return None
+
+
+def matching_image_urls_in_body(body: Tag, feature_image: str) -> list[str]:
+    normalized_feature = normalize_image_url(feature_image)
+    matches: list[str] = []
+    for url in extract_body_urls(body):
+        if normalize_image_url(url) == normalized_feature and url not in matches:
+            matches.append(url)
+    return matches
+
+
+def matching_image_tags_in_body(body: Tag, feature_image: str) -> list[Tag]:
+    normalized_feature = normalize_image_url(feature_image)
+    matches: list[Tag] = []
+    for image in body.find_all("img"):
+        for attr in ("src", "data-src"):
+            if normalize_image_url(str(image.get(attr) or "")) == normalized_feature:
+                matches.append(image)
+                break
+    return matches
+
+
+def extract_body_urls(body: Tag) -> list[str]:
+    urls: list[str] = []
+    for image in body.find_all("img"):
+        for attr in ("src", "data-src"):
+            value = image.get(attr)
+            if value:
+                urls.append(str(value))
+    for anchor in body.find_all("a", href=True):
+        urls.append(str(anchor.get("href") or ""))
+    for source in body.find_all("source"):
+        urls.extend(urls_from_srcset(str(source.get("srcset") or "")))
+    for noscript in body.find_all("noscript"):
+        urls.extend(urls_from_noscript(noscript))
+    return urls
+
+
+def urls_from_noscript(noscript: Tag) -> list[str]:
+    soup = BeautifulSoup(noscript.decode_contents(), "lxml")
+    return extract_body_urls(soup)
+
+
+def urls_from_srcset(value: str) -> list[str]:
+    urls: list[str] = []
+    for candidate in value.split(","):
+        url = candidate.strip().split(" ", 1)[0].strip()
+        if url:
+            urls.append(url)
+    return urls
+
+
+def contains_only_image_links(node: Tag) -> bool:
+    clone = copy.deepcopy(node)
+    for media in clone.find_all(["img", "source", "noscript"]):
+        media.decompose()
+    changed = True
+    while changed:
+        changed = False
+        for child in list(clone.find_all(True)):
+            if child.name in {"br", "hr", "picture"}:
+                child.decompose()
+                changed = True
+            elif not child.get_text(strip=True) and not child.find(True):
+                child.decompose()
+                changed = True
+    return not clone.get_text(strip=True) and not clone.find(["img", "video", "iframe", "embed"])
+
+
+def prune_empty_containers(body: Tag) -> None:
+    changed = True
+    while changed:
+        changed = False
+        for node in list(body.find_all(["p", "div", "a", "noscript"])):
+            if node.find(["img", "video", "iframe", "embed"]):
+                continue
+            if node.get_text(strip=True):
+                continue
+            if node.find(["br", "hr"]):
+                continue
+            node.decompose()
+            changed = True
+
+
+def first_image_from_body(body: Tag) -> str | None:
+    return image_src(find_feature_image_tag(body))
+
+
+def find_feature_image_tag(body: Tag) -> Tag | None:
+    preferred = [img for img in body.find_all("img") if has_class(img, "PhotoSwipeImage")]
+    fallback = list(body.find_all("img"))
+    for image in preferred + [img for img in fallback if img not in preferred]:
+        if is_feature_image_candidate(image):
+            return image
+    return None
+
+
+def image_src(image: Tag | None) -> str | None:
+    if not image:
+        return None
+    return normalize_ghost_image_path(str(image.get("src") or ""))
+
+
+def first_image_from_html(value: str) -> str | None:
+    if not value:
+        return None
+    soup = BeautifulSoup(value, "lxml")
+    return first_image_from_body(soup)
+
+
+def normalize_ghost_image_paths(value: str) -> str:
+    value = value.replace('src="images/', f'src="{GHOST_IMAGE_PREFIX}/')
+    value = value.replace("src='images/", f"src='{GHOST_IMAGE_PREFIX}/")
+    value = value.replace('src="content/images/', f'src="{GHOST_IMAGE_PREFIX}/')
+    value = value.replace("src='content/images/", f"src='{GHOST_IMAGE_PREFIX}/")
+    return value
+
+
+def sanitize_cached_html(value: str) -> str:
+    soup = BeautifulSoup(value, "lxml")
+    root = soup.body or soup
+    remove_image_card_blocks(root)
+    if soup.body:
+        return "".join(str(node) for node in soup.body.contents)
+    return str(root)
+
+
+def normalize_ghost_image_path(value: str | None) -> str | None:
+    if not value:
+        return None
+    value = str(value)
+    if value.startswith(GHOST_IMAGE_PREFIX + "/"):
+        return value
+    if value.startswith("/images/"):
+        return GHOST_IMAGE_PREFIX + value[len("/images") :]
+    if value.startswith("images/"):
+        return f"{GHOST_IMAGE_PREFIX}/{value[len('images/'):]}"
+    if value.startswith("content/images/"):
+        return f"/{value}"
+    return value
+
+
+def normalize_image_url(value: str | None) -> str:
+    if not value:
+        return ""
+    value = html.unescape(str(value)).strip()
+    if not value:
+        return ""
+    value = normalize_ghost_image_path(value) or value
+    parsed = urlparse(value)
+    path = parsed.path or value
+    if path.startswith("/images/"):
+        path = GHOST_IMAGE_PREFIX + path[len("/images") :]
+    elif path.startswith("images/"):
+        path = f"{GHOST_IMAGE_PREFIX}/{path[len('images/'):]}"
+    elif path.startswith("content/images/"):
+        path = f"/{path}"
+    return re.sub(r"/+", "/", path).rstrip("/")
+
+
+def has_class(tag: Tag, class_name: str) -> bool:
+    return class_name in tag.get("class", [])
+
+
+def is_feature_image_candidate(image: Tag) -> bool:
+    src = str(image.get("src") or "")
+    if not src:
+        return False
+    path = urlparse(src).path.lower()
+    if path.endswith(".svg"):
+        return False
+    if any(part in path for part in ("favicon", "apple-touch-icon")):
+        return False
+    if image.find_parent(class_=lambda value: class_list_contains(value, OGP_CARD_CLASSES)):
+        return False
+    if class_list_contains(image.get("class"), OGP_CARD_CLASSES):
+        return False
+    width = parse_dimension(image.get("width"))
+    height = parse_dimension(image.get("height"))
+    if width is None or height is None:
+        style = str(image.get("style") or "")
+        width = width or parse_css_dimension(style, "width")
+        height = height or parse_css_dimension(style, "height")
+    if (width is not None and width < 150) or (height is not None and height < 150):
+        return False
+    if any(token in path for token in ("editor_link", "emoji", "icon", "profile_images")):
+        return False
+    return True
+
+
+def class_list_contains(value: object, targets: set[str]) -> bool:
+    if not value:
+        return False
+    if isinstance(value, str):
+        classes = value.split()
+    else:
+        classes = [str(item) for item in value]
+    return bool(set(classes) & targets)
+
+
+def parse_dimension(value: object) -> int | None:
+    if value is None:
+        return None
+    match = re.search(r"\d+", str(value))
+    return int(match.group(0)) if match else None
+
+
+def parse_css_dimension(style: str, name: str) -> int | None:
+    match = re.search(rf"{name}\s*:\s*(\d+)px", style, re.I)
+    return int(match.group(1)) if match else None
+
+
+def find_blogposting_json_ld(soup: BeautifulSoup) -> dict | None:
+    for script in soup.find_all("script", type="application/ld+json"):
+        if not script.string:
+            continue
+        try:
+            data = json.loads(script.string)
+        except json.JSONDecodeError:
+            continue
+        for item in iter_json_ld_items(data):
+            if item.get("@type") == "BlogPosting":
+                return item
+    return None
+
+
+def iter_json_ld_items(data: object) -> Iterable[dict]:
+    if isinstance(data, dict):
+        graph = data.get("@graph")
+        if isinstance(graph, list):
+            for item in graph:
+                if isinstance(item, dict):
+                    yield item
+        yield data
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                yield item
+
+
+def parse_datetime(value: str) -> str | None:
+    value = clean_text(value)
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).isoformat()
+    except ValueError:
+        pass
+    try:
+        return parsedate_to_datetime(value).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def make_slug(url: str, title: str, published_at: str | None) -> str:
+    entry_match = re.search(r"entry-(\d+)\.html", url)
+    if entry_match:
+        return f"ameblo-{entry_match.group(1)}"
+    prefix = ""
+    if published_at:
+        try:
+            prefix = datetime.fromisoformat(published_at.replace("Z", "+00:00")).strftime("%Y%m%d")
+        except ValueError:
+            prefix = ""
+    base = slugify(title)
+    slug = "-".join(part for part in [prefix, base] if part)[:180]
+    if slug:
+        return slug
+    digest_source = url or title
+    digest = hashlib.sha1(digest_source.encode("utf-8")).hexdigest()[:12]
+    return f"ameblo-{digest}"
+
+
+def slugify(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "-", normalized).strip("-").lower()
+    return normalized
+
+
+def stable_tag_slug(value: str) -> str:
+    if value in TAG_SLUG_OVERRIDES:
+        return TAG_SLUG_OVERRIDES[value]
+    ascii_slug = slugify(value)
+    if ascii_slug:
+        return ascii_slug
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
+    return f"ameblo-theme-{digest}"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Export public Ameblo posts to Ghost JSON.")
+    parser.add_argument("--base-url", default=BASE_URL)
+    parser.add_argument("--author-id", default=AUTHOR_ID, help="Ghost user id used as post author.")
+    parser.add_argument("--author-name", default=AUTHOR_NAME, help="Author name for data.users.")
+    parser.add_argument("--author-slug", default=AUTHOR_SLUG, help="Author slug for data.users.")
+    parser.add_argument("--author-email", default=AUTHOR_EMAIL, help="Author email for data.users.")
+    parser.add_argument("--output", default="output/ghost-import.json")
+    parser.add_argument("--image-dir", default="output/content/images")
+    parser.add_argument("--logs-dir", default="logs")
+    parser.add_argument("--fetched-file", default="fetched_urls.json")
+    parser.add_argument("--limit", type=int, help="Maximum posts to fetch. Defaults to 10 in dry-run mode.")
+    parser.add_argument("--full", action="store_true", help="Fetch all discovered posts.")
+    parser.add_argument("--year", type=int, help="Fetch posts from the specified year using monthly archives.")
+    parser.add_argument("--month", type=int, help="Fetch only this month with --year, from 1 to 12.")
+    parser.add_argument("--min-delay", type=float, default=1.0)
+    parser.add_argument("--max-delay", type=float, default=3.0)
+    parser.add_argument("--max-listing-pages", type=int, default=500)
+    parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument("--refresh", action="store_true", help="Refetch even when URL exists in fetched_urls.json.")
+    parser.add_argument(
+        "--remove-feature-image-from-body",
+        action="store_true",
+        help=(
+            "Deprecated alias for --remove-duplicate-noscript-images. "
+            "Does not remove the feature image from body."
+        ),
+    )
+    parser.add_argument(
+        "--remove-duplicate-noscript-images",
+        action="store_true",
+        help="Remove Ameblo noscript image duplicates while keeping normal body img tags.",
+    )
+    parser.add_argument(
+        "--debug-title",
+        action="store_true",
+        help="Print title candidates and the selected title for each fetched article.",
+    )
+    parser.add_argument(
+        "--no-users",
+        action="store_true",
+        help="Do not output data.users; use --author-id as an existing Ghost user id.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.month and not args.year:
+        raise SystemExit("--month requires --year")
+    if args.month and not 1 <= args.month <= 12:
+        raise SystemExit("--month must be between 1 and 12")
+    if args.year and args.full:
+        print("[info] --year is set; ignoring --full and using the year archive scope.")
+    if args.remove_feature_image_from_body:
+        print(
+            "[warn] --remove-feature-image-from-body is deprecated; "
+            "using --remove-duplicate-noscript-images behavior instead."
+        )
+    dry_run = not args.full and not args.year
+    if args.year or args.full:
+        limit = args.limit or 0
+    else:
+        limit = args.limit or 10
+    config = ExportConfig(
+        base_url=args.base_url,
+        output_json=Path(args.output),
+        image_dir=Path(args.image_dir),
+        logs_dir=Path(args.logs_dir),
+        fetched_file=Path(args.fetched_file),
+        dry_run=dry_run,
+        limit=limit,
+        min_delay=args.min_delay,
+        max_delay=max(args.min_delay, args.max_delay),
+        max_listing_pages=args.max_listing_pages,
+        timeout=args.timeout,
+        download_images=True,
+        refresh=args.refresh,
+        remove_feature_image_from_body=args.remove_feature_image_from_body,
+        remove_duplicate_noscript_images=(
+            args.remove_duplicate_noscript_images or args.remove_feature_image_from_body
+        ),
+        debug_title=args.debug_title,
+        year=args.year,
+        month=args.month,
+        include_users=not args.no_users,
+        author_id=args.author_id,
+        author_name=args.author_name,
+        author_slug=args.author_slug,
+        author_email=args.author_email,
+    )
+    AmebloExporter(config).run()
+
+
+if __name__ == "__main__":
+    main()
