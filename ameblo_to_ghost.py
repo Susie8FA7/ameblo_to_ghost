@@ -31,20 +31,23 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-BASE_URL = "https://ameblo.jp/susie8fa7/"
+BASE_URL = "https://ameblo.jp/YOUR_AMEBLO_ID/"
 USER_AGENT = (
     "AmebloToGhostExporter/0.1 "
     "(personal archive; requests+BeautifulSoup4; contact: local-user)"
 )
-ARTICLE_RE = re.compile(r"/susie8fa7/entry-\d+\.html$")
-THEME_PATH_RE = re.compile(r"/susie8fa7/theme-\d+\.html$")
-LISTING_HINT_RE = re.compile(
-    r"/susie8fa7/(?:$|page-\d+\.html|entrylist(?:-\d+)?\.html|"
+ARTICLE_PATH_RE = re.compile(r"/[^/]+/entry-\d+\.html$")
+THEME_PATH_RE = re.compile(r"/[^/]+/theme-\d+\.html$")
+LISTING_HINT_PATH_RE = re.compile(
+    r"/[^/]+/(?:$|page-\d+\.html|entrylist(?:-\d+)?\.html|"
     r"theme-\d+\.html|archive[^/]*\.html)"
 )
 IMAGE_EXT_RE = re.compile(r"\.(?:jpe?g|png|gif|webp|svg)(?:$|\?)", re.I)
 GHOST_IMAGE_PREFIX = "/content/images"
-AUTHOR_ID = "6a23714bfcc3c70001503a30"
+AUTHOR_ID = "REPLACE_WITH_EXISTING_GHOST_AUTHOR_ID"
+AUTHOR_NAME = "Ameblo Author"
+AUTHOR_SLUG = "ameblo-author"
+AUTHOR_EMAIL = "ameblo-author@example.invalid"
 OGP_CARD_CLASSES = {"ogpCard_root", "ogpCard_wrap", "ogpCard_icon", "ogpCard_image"}
 TAG_SLUG_OVERRIDES = {
     "ゲーム": "game",
@@ -76,6 +79,9 @@ class ExportConfig:
     month: int | None
     include_users: bool
     author_id: str
+    author_name: str
+    author_slug: str
+    author_email: str
 
 
 @dataclass
@@ -222,14 +228,14 @@ class AmebloExporter:
                 if not is_same_blog_url(normalized, self.config.base_url):
                     continue
                 path = urlparse(normalized).path
-                if ARTICLE_RE.search(path):
+                if is_article_path(path, self.config.base_url):
                     normalized = canonical_article_url(normalized)
                     if listing_theme:
                         self.article_theme_hints.setdefault(normalized, listing_theme)
                     if normalized not in article_seen:
                         article_seen.add(normalized)
                         article_urls.append(normalized)
-                elif LISTING_HINT_RE.search(path) and normalized not in seen_listing:
+                elif is_listing_hint_path(path, self.config.base_url) and normalized not in seen_listing:
                     if is_numeric_theme_url(normalized):
                         self.theme_url_set.add(normalized)
                     if normalized not in queue:
@@ -281,7 +287,7 @@ class AmebloExporter:
                 if not is_same_blog_url(normalized, self.config.base_url):
                     continue
                 path = urlparse(normalized).path
-                if ARTICLE_RE.search(path):
+                if is_article_path(path, self.config.base_url):
                     normalized = canonical_article_url(normalized)
                     if normalized not in article_seen:
                         article_seen.add(normalized)
@@ -316,10 +322,11 @@ class AmebloExporter:
 
     def is_same_year_archive_url(self, url: str) -> bool:
         path = urlparse(url).path
+        blog_id = re.escape(blog_id_from_base_url(self.config.base_url) or "")
         if self.config.month:
-            pattern = rf"/susie8fa7/archive-{self.config.year}{self.config.month:02d}(?:-\d+)?\.html$"
+            pattern = rf"/{blog_id}/archive-{self.config.year}{self.config.month:02d}(?:-\d+)?\.html$"
         else:
-            pattern = rf"/susie8fa7/archive-{self.config.year}\d{{2}}(?:-\d+)?\.html$"
+            pattern = rf"/{blog_id}/archive-{self.config.year}\d{{2}}(?:-\d+)?\.html$"
         return bool(re.search(pattern, path))
 
     def populate_theme_hints_for_targets(self, article_urls: list[str]) -> None:
@@ -345,7 +352,7 @@ class AmebloExporter:
                 if not is_same_blog_url(normalized, self.config.base_url):
                     continue
                 path = urlparse(normalized).path
-                if ARTICLE_RE.search(path):
+                if is_article_path(path, self.config.base_url):
                     article_url = canonical_article_url(normalized)
                     if listing_theme and article_url in missing:
                         self.article_theme_hints.setdefault(article_url, listing_theme)
@@ -360,13 +367,13 @@ class AmebloExporter:
                         theme_queue.append(normalized)
             self.sleep()
 
-    @staticmethod
-    def is_theme_pagination_url(url: str, theme_url: str) -> bool:
+    def is_theme_pagination_url(self, url: str, theme_url: str) -> bool:
         theme_path = urlparse(theme_url).path
         match = re.search(r"(theme-\d+)\.html$", theme_path)
         if not match:
             return False
-        return bool(re.search(rf"/susie8fa7/{match.group(1)}(?:-\d+)?\.html$", urlparse(url).path))
+        blog_id = re.escape(blog_id_from_base_url(self.config.base_url) or "")
+        return bool(re.search(rf"/{blog_id}/{match.group(1)}(?:-\d+)?\.html$", urlparse(url).path))
 
     def parse_article(self, url: str) -> ArticleData:
         soup = self.fetch_soup(url)
@@ -376,7 +383,8 @@ class AmebloExporter:
         if not theme:
             theme = self.article_theme_hints.get(url)
         body = self.extract_body(soup)
-        remove_image_card_blocks(body)
+        for warning in remove_image_card_blocks(body):
+            self.log_error(url, "warning", warning)
         api_hashtags = self.fetch_hashtags_from_api(url)
         hashtags = merge_unique(api_hashtags, self.extract_hashtags(soup))
         if theme:
@@ -489,11 +497,10 @@ class AmebloExporter:
             return datetime(year, month, day, hour, minute).isoformat()
         return None
 
-    @staticmethod
-    def extract_theme(soup: BeautifulSoup) -> str | None:
+    def extract_theme(self, soup: BeautifulSoup) -> str | None:
         for anchor in soup.find_all("a", href=True):
             href = anchor.get("href", "")
-            if is_numeric_theme_url(urljoin(BASE_URL, href)):
+            if is_numeric_theme_url(urljoin(self.config.base_url, href)):
                 value = clean_theme_name(anchor.get_text(" ", strip=True))
                 if value:
                     return value
@@ -654,9 +661,9 @@ class AmebloExporter:
         users = [
             {
                 "id": author_id,
-                "name": "Susie8FA7",
-                "slug": "susie8fa7",
-                "email": "susie8fa7@example.invalid",
+                "name": self.config.author_name,
+                "slug": self.config.author_slug,
+                "email": self.config.author_email,
                 "profile_image": None,
                 "cover_image": None,
                 "bio": None,
@@ -679,9 +686,10 @@ class AmebloExporter:
         posts_authors: list[dict] = []
 
         def ensure_tag(name: str, description: str) -> str:
-            if name not in tags_by_name:
+            key = tag_identity_key(name)
+            if key not in tags_by_name:
                 tag_id = uuid.uuid4().hex
-                tags_by_name[name] = tag_id
+                tags_by_name[key] = tag_id
                 tags.append(
                     {
                         "id": tag_id,
@@ -690,7 +698,7 @@ class AmebloExporter:
                         "description": description,
                     }
                 )
-            return tags_by_name[name]
+            return tags_by_name[key]
 
         for article in articles:
             post_id = uuid.uuid4().hex
@@ -722,11 +730,17 @@ class AmebloExporter:
                 if hashtag != article.theme:
                     tag_names.append((hashtag, "Imported from Ameblo hashtag"))
 
-            for sort_order, (tag_name, description) in enumerate(tag_names):
+            seen_post_tag_ids: set[str] = set()
+            sort_order = 0
+            for tag_name, description in tag_names:
                 tag_id = ensure_tag(tag_name, description)
+                if tag_id in seen_post_tag_ids:
+                    continue
+                seen_post_tag_ids.add(tag_id)
                 posts_tags.append(
                     {"post_id": post_id, "tag_id": tag_id, "sort_order": sort_order}
                 )
+                sort_order += 1
 
         data = {
             "posts": posts,
@@ -805,6 +819,23 @@ def normalize_url(url: str) -> str:
 def canonical_article_url(url: str) -> str:
     parsed = urlparse(url)
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
+def is_article_path(path: str, base_url: str) -> bool:
+    blog_id = re.escape(blog_id_from_base_url(base_url) or "")
+    return bool(blog_id and re.search(rf"/{blog_id}/entry-\d+\.html$", path))
+
+
+def is_listing_hint_path(path: str, base_url: str) -> bool:
+    blog_id = re.escape(blog_id_from_base_url(base_url) or "")
+    return bool(
+        blog_id
+        and re.search(
+            rf"/{blog_id}/(?:$|page-\d+\.html|entrylist(?:-\d+)?\.html|"
+            rf"theme-\d+\.html|archive[^/]*\.html)",
+            path,
+        )
+    )
 
 
 def blog_id_from_base_url(base_url: str) -> str | None:
@@ -979,9 +1010,8 @@ def append_source_link(body: Tag, article_url: str) -> None:
         body.append(node)
 
 
-def remove_image_card_blocks(body: Tag) -> None:
-    for node in body.find_all(class_=lambda value: class_list_contains(value, OGP_CARD_CLASSES)):
-        node.decompose()
+def remove_image_card_blocks(body: Tag) -> list[str]:
+    warnings = convert_ogp_cards_to_links(body)
 
     card_class_patterns = (
         "kg-card",
@@ -997,6 +1027,96 @@ def remove_image_card_blocks(body: Tag) -> None:
     for attr in ("data-lexical-image", "data-mobiledoc-card", "data-kg-card"):
         for node in body.find_all(attrs={attr: True}):
             node.decompose()
+    return warnings
+
+
+def convert_ogp_cards_to_links(body: Tag) -> list[str]:
+    warnings: list[str] = []
+    candidates = list(
+        body.find_all(class_=lambda value: class_list_contains(value, {"ogpCard_root", "ogpCard_wrap"}))
+    )
+    for card in candidates:
+        if not card.parent:
+            continue
+        if card.find_parent(class_=lambda value: class_list_contains(value, {"ogpCard_root", "ogpCard_wrap"})):
+            continue
+        href = extract_ogp_card_href(card)
+        if not href:
+            warnings.append("could not convert OGP card: missing href")
+            card.decompose()
+            continue
+        title = extract_ogp_card_title(card, href)
+        replacement = make_link_paragraph(href, title)
+        if is_duplicate_previous_link(card, href):
+            card.decompose()
+        else:
+            card.replace_with(replacement)
+    prune_duplicate_consecutive_links(body)
+    return warnings
+
+
+def extract_ogp_card_href(card: Tag) -> str | None:
+    for anchor in card.find_all("a", href=True):
+        href = str(anchor.get("href") or "").strip()
+        if href and not href.startswith(("#", "javascript:", "mailto:")):
+            if not IMAGE_EXT_RE.search(urlparse(href).path):
+                return href
+    return None
+
+
+def extract_ogp_card_title(card: Tag, href: str) -> str:
+    title_selectors = [
+        ".ogpCard_title",
+        ".ogpCardTitle",
+        ".ogpCard_text",
+        ".ogpCard_description",
+        ".ogpCard_content",
+    ]
+    for selector in title_selectors:
+        node = card.select_one(selector)
+        if node:
+            value = clean_text(node.get_text(" ", strip=True))
+            if value and value != href:
+                return value
+    for anchor in card.find_all("a", href=True):
+        if str(anchor.get("href") or "").strip() == href:
+            value = clean_text(anchor.get_text(" ", strip=True))
+            if value and value != href:
+                return value
+    return href
+
+
+def make_link_paragraph(href: str, text: str) -> Tag:
+    fragment = BeautifulSoup(
+        f'<p><a href="{html.escape(href, quote=True)}">{html.escape(text)}</a></p>',
+        "lxml",
+    )
+    return fragment.find("p") or fragment
+
+
+def is_duplicate_previous_link(card: Tag, href: str) -> bool:
+    previous = card.find_previous_sibling()
+    while isinstance(previous, Tag) and not previous.get_text(strip=True):
+        previous = previous.find_previous_sibling()
+    if not isinstance(previous, Tag):
+        return False
+    anchors = previous.find_all("a", href=True)
+    return len(anchors) == 1 and str(anchors[0].get("href") or "").strip() == href
+
+
+def prune_duplicate_consecutive_links(body: Tag) -> None:
+    previous_href = None
+    for paragraph in list(body.find_all("p")):
+        text = paragraph.get_text(" ", strip=True)
+        anchors = paragraph.find_all("a", href=True)
+        if len(anchors) == 1 and text:
+            href = str(anchors[0].get("href") or "").strip()
+            if href and href == previous_href:
+                paragraph.decompose()
+                continue
+            previous_href = href
+        elif text:
+            previous_href = None
 
 
 def remove_article_chrome(body: Tag) -> None:
@@ -1395,6 +1515,9 @@ def slugify(value: str) -> str:
 def stable_tag_slug(value: str) -> str:
     if value in TAG_SLUG_OVERRIDES:
         return TAG_SLUG_OVERRIDES[value]
+    if any(ord(char) > 127 for char in value):
+        digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
+        return f"ameblo-theme-{digest}"
     ascii_slug = slugify(value)
     if ascii_slug:
         return ascii_slug
@@ -1402,12 +1525,19 @@ def stable_tag_slug(value: str) -> str:
     return f"ameblo-theme-{digest}"
 
 
+def tag_identity_key(value: str) -> str:
+    return unicodedata.normalize("NFKC", clean_text(value)).casefold()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export public Ameblo posts to Ghost JSON.")
     parser.add_argument("--base-url", default=BASE_URL)
     parser.add_argument("--author-id", default=AUTHOR_ID, help="Ghost user id used as post author.")
-    parser.add_argument("--output", help="Output Ghost import JSON path.")
-    parser.add_argument("--image-dir", help="Directory for downloaded images.")
+    parser.add_argument("--author-name", default=AUTHOR_NAME, help="Author name for data.users.")
+    parser.add_argument("--author-slug", default=AUTHOR_SLUG, help="Author slug for data.users.")
+    parser.add_argument("--author-email", default=AUTHOR_EMAIL, help="Author email for data.users.")
+    parser.add_argument("--output", default="output/ghost-import.json")
+    parser.add_argument("--image-dir", default="output/content/images")
     parser.add_argument("--logs-dir", default="logs")
     parser.add_argument("--fetched-file", default="fetched_urls.json")
     parser.add_argument("--limit", type=int, help="Maximum posts to fetch. Defaults to 10 in dry-run mode.")
@@ -1440,7 +1570,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-users",
         action="store_true",
-        help="Do not output data.users; use AUTHOR_ID as an existing Ghost user id.",
+        help="Do not output data.users; use --author-id as an existing Ghost user id.",
     )
     return parser.parse_args()
 
@@ -1463,13 +1593,10 @@ def main() -> None:
         limit = args.limit or 0
     else:
         limit = args.limit or 10
-    output_dir = Path(f"output{args.year}") if args.year else Path("output")
-    output_json = Path(args.output) if args.output else output_dir / "ghost-import.json"
-    image_dir = Path(args.image_dir) if args.image_dir else output_dir / "content" / "images"
     config = ExportConfig(
         base_url=args.base_url,
-        output_json=output_json,
-        image_dir=image_dir,
+        output_json=Path(args.output),
+        image_dir=Path(args.image_dir),
         logs_dir=Path(args.logs_dir),
         fetched_file=Path(args.fetched_file),
         dry_run=dry_run,
@@ -1489,6 +1616,9 @@ def main() -> None:
         month=args.month,
         include_users=not args.no_users,
         author_id=args.author_id,
+        author_name=args.author_name,
+        author_slug=args.author_slug,
+        author_email=args.author_email,
     )
     AmebloExporter(config).run()
 
