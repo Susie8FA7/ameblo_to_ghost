@@ -36,9 +36,9 @@ USER_AGENT = (
     "AmebloToGhostExporter/0.1 "
     "(personal archive; requests+BeautifulSoup4; contact: local-user)"
 )
-ARTICLE_PATH_RE = re.compile(r"/[^/]+/entry-\d+\.html$")
+ARTICLE_RE = re.compile(r"/[^/]+/entry-\d+\.html$")
 THEME_PATH_RE = re.compile(r"/[^/]+/theme-\d+\.html$")
-LISTING_HINT_PATH_RE = re.compile(
+LISTING_HINT_RE = re.compile(
     r"/[^/]+/(?:$|page-\d+\.html|entrylist(?:-\d+)?\.html|"
     r"theme-\d+\.html|archive[^/]*\.html)"
 )
@@ -69,9 +69,11 @@ class ExportConfig:
     min_delay: float
     max_delay: float
     max_listing_pages: int
+    max_page_scan: int
     timeout: int
     download_images: bool
     refresh: bool
+    diff_only: bool
     remove_feature_image_from_body: bool
     remove_duplicate_noscript_images: bool
     debug_title: bool
@@ -167,23 +169,43 @@ class AmebloExporter:
 
     def run(self) -> None:
         article_urls = self.discover_article_urls()
-        if self.config.limit:
+        if self.config.limit and not self.config.year:
             article_urls = article_urls[: self.config.limit]
 
         posts: list[ArticleData] = []
+        skipped_out_of_scope = 0
+        pending_fetched_updates: dict[str, dict] = {}
         for index, url in enumerate(article_urls, start=1):
+            if self.config.diff_only and url in self.fetched_urls:
+                print(f"[skip-existing] {url}")
+                continue
             cached = None if self.config.refresh else self.fetched_urls.get(url)
             if cached and cached.get("html"):
                 print(f"[cache] already fetched: {url}")
-                posts.append(ArticleData.from_dict(cached))
+                article = ArticleData.from_dict(cached)
+                if self.article_matches_scope(article):
+                    posts.append(article)
+                    if self.config.limit and len(posts) >= self.config.limit:
+                        break
                 continue
             print(f"[post {index}/{len(article_urls)}] {url}")
             try:
                 article = self.parse_article(url)
+                if not self.article_matches_scope(article):
+                    print(f"[skip-out-of-scope] {url} published_at={article.published_at}")
+                    skipped_out_of_scope += 1
+                    self.sleep()
+                    continue
                 posts.append(article)
-                self.fetched_urls[url] = article.to_dict()
-                self.fetched_urls[url]["fetched_at"] = datetime.now(timezone.utc).isoformat()
-                self._save_fetched_urls()
+                fetched_record = article.to_dict()
+                fetched_record["fetched_at"] = datetime.now(timezone.utc).isoformat()
+                if self.config.diff_only:
+                    pending_fetched_updates[url] = fetched_record
+                else:
+                    self.fetched_urls[url] = fetched_record
+                    self._save_fetched_urls()
+                if self.config.limit and len(posts) >= self.config.limit:
+                    break
             except Exception as exc:  # noqa: BLE001 - log and continue the export.
                 self.log_error(url, "parse_failed", str(exc))
             self.sleep()
@@ -192,7 +214,34 @@ class AmebloExporter:
         self.config.output_json.write_text(
             json.dumps(ghost_json, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        if pending_fetched_updates:
+            self.fetched_urls.update(pending_fetched_updates)
+            self._save_fetched_urls()
+        if self.config.diff_only and not posts:
+            print("[done] no new articles found for diff-only export")
+        if self.config.year:
+            print(
+                f"[year-scope] output_posts={len(posts)} "
+                f"skipped_out_of_scope={skipped_out_of_scope}"
+            )
         print(f"[done] wrote {self.config.output_json}")
+
+    def article_matches_scope(self, article: ArticleData) -> bool:
+        if not self.config.year:
+            return True
+        if not article.published_at:
+            self.log_error(article.url, "year_filter_failed", "published_at is missing")
+            return False
+        try:
+            published = datetime.fromisoformat(article.published_at.replace("Z", "+00:00"))
+        except ValueError:
+            self.log_error(article.url, "year_filter_failed", f"invalid published_at: {article.published_at}")
+            return False
+        if published.year != self.config.year:
+            return False
+        if self.config.month and published.month != self.config.month:
+            return False
+        return True
 
     def discover_article_urls(self) -> list[str]:
         if self.config.year:
@@ -228,14 +277,14 @@ class AmebloExporter:
                 if not is_same_blog_url(normalized, self.config.base_url):
                     continue
                 path = urlparse(normalized).path
-                if is_article_path(path, self.config.base_url):
+                if ARTICLE_RE.search(path):
                     normalized = canonical_article_url(normalized)
                     if listing_theme:
                         self.article_theme_hints.setdefault(normalized, listing_theme)
                     if normalized not in article_seen:
                         article_seen.add(normalized)
                         article_urls.append(normalized)
-                elif is_listing_hint_path(path, self.config.base_url) and normalized not in seen_listing:
+                elif LISTING_HINT_RE.search(path) and normalized not in seen_listing:
                     if is_numeric_theme_url(normalized):
                         self.theme_url_set.add(normalized)
                     if normalized not in queue:
@@ -256,56 +305,175 @@ class AmebloExporter:
 
     def discover_article_urls_by_year(self) -> list[str]:
         months = [self.config.month] if self.config.month else list(range(12, 0, -1))
-        queue = [
-            urljoin(self.config.base_url, f"archive-{self.config.year}{month:02d}.html")
-            for month in months
-        ]
         seen_listing: set[str] = set()
         article_urls: list[str] = []
         article_seen: set[str] = set()
+        scanned_pages: dict[int, list[str]] = {}
 
-        while queue and len(seen_listing) < self.config.max_listing_pages:
-            listing_url = normalize_url(queue.pop(0))
-            if listing_url in seen_listing:
-                continue
-            seen_listing.add(listing_url)
-            print(f"[list] {listing_url}")
-            try:
-                soup = self.fetch_soup(listing_url)
-            except requests.HTTPError as exc:
-                status_code = exc.response.status_code if exc.response is not None else None
-                if status_code == 404:
+        for month in months:
+            page = 1
+            queued_pages: list[str] = [self.archive_url_for_month_page(month, page)]
+            month_urls: list[str] = []
+            while queued_pages and len(seen_listing) < self.config.max_listing_pages:
+                listing_url = normalize_url(queued_pages.pop(0))
+                if listing_url in seen_listing:
                     continue
-                self.log_error(listing_url, "listing_fetch_failed", str(exc))
-                continue
-            except Exception as exc:  # noqa: BLE001
-                self.log_error(listing_url, "listing_fetch_failed", str(exc))
-                continue
+                seen_listing.add(listing_url)
+                print(f"[list] {listing_url}")
+                try:
+                    soup = self.fetch_soup(listing_url)
+                except requests.HTTPError as exc:
+                    status_code = exc.response.status_code if exc.response is not None else None
+                    if status_code == 404:
+                        break
+                    self.log_error(listing_url, "listing_fetch_failed", str(exc))
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    self.log_error(listing_url, "listing_fetch_failed", str(exc))
+                    break
 
-            for href in self.extract_hrefs(soup, listing_url):
-                normalized = normalize_url(href)
-                if not is_same_blog_url(normalized, self.config.base_url):
-                    continue
-                path = urlparse(normalized).path
-                if is_article_path(path, self.config.base_url):
-                    normalized = canonical_article_url(normalized)
-                    if normalized not in article_seen:
-                        article_seen.add(normalized)
-                        article_urls.append(normalized)
-                        if self.config.limit and len(article_urls) >= self.config.limit:
-                            self.discover_theme_urls_from_index()
-                            self.populate_theme_hints_for_targets(article_urls)
-                            return article_urls
-                elif is_numeric_theme_url(normalized):
-                    self.theme_url_set.add(normalized)
-                elif self.is_same_year_archive_url(normalized) and normalized not in seen_listing:
-                    if normalized not in queue:
-                        queue.append(normalized)
-            self.sleep()
+                added_on_page = 0
+                for href in self.extract_hrefs(soup, listing_url):
+                    normalized = normalize_url(href)
+                    if not is_same_blog_url(normalized, self.config.base_url):
+                        continue
+                    path = urlparse(normalized).path
+                    if ARTICLE_RE.search(path):
+                        normalized = canonical_article_url(normalized)
+                        if normalized not in article_seen:
+                            article_seen.add(normalized)
+                            article_urls.append(normalized)
+                            month_urls.append(normalized)
+                            added_on_page += 1
+                            if self.config.limit and not self.config.diff_only and len(article_urls) >= self.config.limit:
+                                self.discover_theme_urls_from_index()
+                                self.populate_theme_hints_for_targets(article_urls)
+                                return article_urls
+                    elif is_numeric_theme_url(normalized):
+                        self.theme_url_set.add(normalized)
+                    elif self.is_same_month_archive_url(normalized, month) and normalized not in seen_listing:
+                        if normalized not in queued_pages:
+                            queued_pages.append(normalized)
+                if added_on_page == 0:
+                    break
+                page += 1
+                next_page = self.archive_url_for_month_page(month, page)
+                if next_page not in seen_listing and next_page not in queued_pages:
+                    queued_pages.append(next_page)
+                self.sleep()
+
+            if len(month_urls) == 20:
+                print(
+                    f"[archive-truncated] {self.config.year}-{month:02d} "
+                    "archive returned exactly 20 article URLs; page-N anchor scan enabled"
+                )
+                self.discover_chronological_supplement_for_month(
+                    month, month_urls, article_urls, article_seen, scanned_pages
+                )
+            elif month_urls:
+                print(
+                    f"[archive-complete] {self.config.year}-{month:02d} "
+                    f"archive returned {len(month_urls)} article URLs; no page-N supplement"
+                )
 
         self.discover_theme_urls_from_index()
         self.populate_theme_hints_for_targets(article_urls)
         return article_urls
+
+    def archive_url_for_month_page(self, month: int, page: int) -> str:
+        suffix = "" if page == 1 else f"-{page}"
+        return urljoin(self.config.base_url, f"archive-{self.config.year}{month:02d}{suffix}.html")
+
+    def is_same_month_archive_url(self, url: str, month: int) -> bool:
+        path = urlparse(url).path
+        blog_id = re.escape(blog_id_from_base_url(self.config.base_url) or "")
+        pattern = rf"/{blog_id}/archive-{self.config.year}{month:02d}(?:-\d+)?\.html$"
+        return bool(re.search(pattern, path))
+
+    def discover_chronological_supplement_for_month(
+        self,
+        month: int,
+        anchor_urls: list[str],
+        article_urls: list[str],
+        article_seen: set[str],
+        scanned_pages: dict[int, list[str]],
+    ) -> None:
+        anchor_set = set(anchor_urls)
+        found = self.find_anchor_page(anchor_set, scanned_pages)
+        if not found:
+            print(f"[anchor-page] {self.config.year}-{month:02d} not found within {self.config.max_page_scan}")
+            return
+        anchor_page, anchor_page_urls = found
+        print(f"[anchor-page] {self.config.year}-{month:02d} page={anchor_page}")
+        start_page = max(1, anchor_page - 2)
+        end_page = min(self.config.max_page_scan, anchor_page + 2)
+        print(f"[supplement-range] {self.config.year}-{month:02d} page-{start_page}..page-{end_page}")
+
+        before = len(article_urls)
+        for page in range(start_page, end_page + 1):
+            page_urls = anchor_page_urls if page == anchor_page else self.fetch_chronological_page_urls(
+                page, scanned_pages
+            )
+            for url in page_urls:
+                if url in anchor_set:
+                    continue
+                if url not in article_seen:
+                    article_seen.add(url)
+                    article_urls.append(url)
+        added = len(article_urls) - before
+        print(f"[supplement-candidates] {self.config.year}-{month:02d} added={added}")
+
+    def find_anchor_page(
+        self, anchor_urls: set[str], scanned_pages: dict[int, list[str]]
+    ) -> tuple[int, list[str]] | None:
+        last_anchor_page: int | None = None
+        last_anchor_page_urls: list[str] = []
+        stop_after_pages_without_anchor = 5
+        for page in range(1, self.config.max_page_scan + 1):
+            page_urls = self.fetch_chronological_page_urls(page, scanned_pages)
+            if not page_urls:
+                continue
+            has_anchor = any(url in anchor_urls for url in page_urls)
+            if has_anchor:
+                last_anchor_page = page
+                last_anchor_page_urls = page_urls
+            elif last_anchor_page and page - last_anchor_page >= stop_after_pages_without_anchor:
+                break
+        if last_anchor_page is None:
+            return None
+        return last_anchor_page, last_anchor_page_urls
+
+    def fetch_chronological_page_urls(self, page: int, scanned_pages: dict[int, list[str]]) -> list[str]:
+        if page in scanned_pages:
+            return scanned_pages[page]
+        listing_url = urljoin(self.config.base_url, "" if page == 1 else f"page-{page}.html")
+        listing_url = normalize_url(listing_url)
+        if page == 1 or page % 25 == 0:
+            print(f"[scan-page] {listing_url}")
+        try:
+            soup = self.fetch_soup(listing_url)
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code != 404:
+                self.log_error(listing_url, "listing_fetch_failed", str(exc))
+            scanned_pages[page] = []
+            return []
+        except Exception as exc:  # noqa: BLE001
+            self.log_error(listing_url, "listing_fetch_failed", str(exc))
+            scanned_pages[page] = []
+            return []
+
+        page_urls: list[str] = []
+        for href in self.extract_hrefs(soup, listing_url):
+            normalized = normalize_url(href)
+            if not is_same_blog_url(normalized, self.config.base_url):
+                continue
+            path = urlparse(normalized).path
+            if ARTICLE_RE.search(path):
+                page_urls.append(canonical_article_url(normalized))
+        unique_page_urls = list(dict.fromkeys(page_urls))
+        scanned_pages[page] = unique_page_urls
+        return unique_page_urls
 
     def discover_theme_urls_from_index(self) -> None:
         for listing_url in [self.config.base_url, urljoin(self.config.base_url, "entrylist.html")]:
@@ -352,7 +520,7 @@ class AmebloExporter:
                 if not is_same_blog_url(normalized, self.config.base_url):
                     continue
                 path = urlparse(normalized).path
-                if is_article_path(path, self.config.base_url):
+                if ARTICLE_RE.search(path):
                     article_url = canonical_article_url(normalized)
                     if listing_theme and article_url in missing:
                         self.article_theme_hints.setdefault(article_url, listing_theme)
@@ -367,13 +535,15 @@ class AmebloExporter:
                         theme_queue.append(normalized)
             self.sleep()
 
-    def is_theme_pagination_url(self, url: str, theme_url: str) -> bool:
+    @staticmethod
+    def is_theme_pagination_url(url: str, theme_url: str) -> bool:
         theme_path = urlparse(theme_url).path
-        match = re.search(r"(theme-\d+)\.html$", theme_path)
+        match = re.search(r"/([^/]+)/(theme-\d+)\.html$", theme_path)
         if not match:
             return False
-        blog_id = re.escape(blog_id_from_base_url(self.config.base_url) or "")
-        return bool(re.search(rf"/{blog_id}/{match.group(1)}(?:-\d+)?\.html$", urlparse(url).path))
+        blog_id = re.escape(match.group(1))
+        theme_id = re.escape(match.group(2))
+        return bool(re.search(rf"/{blog_id}/{theme_id}(?:-\d+)?\.html$", urlparse(url).path))
 
     def parse_article(self, url: str) -> ArticleData:
         soup = self.fetch_soup(url)
@@ -497,10 +667,11 @@ class AmebloExporter:
             return datetime(year, month, day, hour, minute).isoformat()
         return None
 
-    def extract_theme(self, soup: BeautifulSoup) -> str | None:
+    @staticmethod
+    def extract_theme(soup: BeautifulSoup) -> str | None:
         for anchor in soup.find_all("a", href=True):
             href = anchor.get("href", "")
-            if is_numeric_theme_url(urljoin(self.config.base_url, href)):
+            if is_numeric_theme_url(urljoin(BASE_URL, href)):
                 value = clean_theme_name(anchor.get_text(" ", strip=True))
                 if value:
                     return value
@@ -770,7 +941,9 @@ class AmebloExporter:
 
     def _save_fetched_urls(self) -> None:
         self.config.fetched_file.write_text(
-            json.dumps(self.fetched_urls, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(self.fetched_urls, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+            newline="\n",
         )
 
     def _ensure_error_log(self) -> None:
@@ -819,23 +992,6 @@ def normalize_url(url: str) -> str:
 def canonical_article_url(url: str) -> str:
     parsed = urlparse(url)
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
-
-
-def is_article_path(path: str, base_url: str) -> bool:
-    blog_id = re.escape(blog_id_from_base_url(base_url) or "")
-    return bool(blog_id and re.search(rf"/{blog_id}/entry-\d+\.html$", path))
-
-
-def is_listing_hint_path(path: str, base_url: str) -> bool:
-    blog_id = re.escape(blog_id_from_base_url(base_url) or "")
-    return bool(
-        blog_id
-        and re.search(
-            rf"/{blog_id}/(?:$|page-\d+\.html|entrylist(?:-\d+)?\.html|"
-            rf"theme-\d+\.html|archive[^/]*\.html)",
-            path,
-        )
-    )
 
 
 def blog_id_from_base_url(base_url: str) -> str | None:
@@ -1536,8 +1692,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--author-name", default=AUTHOR_NAME, help="Author name for data.users.")
     parser.add_argument("--author-slug", default=AUTHOR_SLUG, help="Author slug for data.users.")
     parser.add_argument("--author-email", default=AUTHOR_EMAIL, help="Author email for data.users.")
-    parser.add_argument("--output", default="output/ghost-import.json")
-    parser.add_argument("--image-dir", default="output/content/images")
+    parser.add_argument("--output", help="Output Ghost import JSON path.")
+    parser.add_argument("--output-dir", help="Output directory for ghost-import.json and images_manifest.csv.")
+    parser.add_argument("--image-dir", help="Directory for downloaded images.")
     parser.add_argument("--logs-dir", default="logs")
     parser.add_argument("--fetched-file", default="fetched_urls.json")
     parser.add_argument("--limit", type=int, help="Maximum posts to fetch. Defaults to 10 in dry-run mode.")
@@ -1547,8 +1704,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-delay", type=float, default=1.0)
     parser.add_argument("--max-delay", type=float, default=3.0)
     parser.add_argument("--max-listing-pages", type=int, default=500)
+    parser.add_argument(
+        "--max-page-scan",
+        type=int,
+        default=500,
+        help="Maximum page-N.html number to scan when supplementing year/month archives.",
+    )
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--refresh", action="store_true", help="Refetch even when URL exists in fetched_urls.json.")
+    parser.add_argument(
+        "--diff-only",
+        action="store_true",
+        help="Skip URLs already present in fetched_urls.json and export only newly discovered articles.",
+    )
     parser.add_argument(
         "--remove-feature-image-from-body",
         action="store_true",
@@ -1570,7 +1738,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-users",
         action="store_true",
-        help="Do not output data.users; use --author-id as an existing Ghost user id.",
+        help="Do not output data.users; use AUTHOR_ID as an existing Ghost user id.",
     )
     return parser.parse_args()
 
@@ -1581,6 +1749,8 @@ def main() -> None:
         raise SystemExit("--month requires --year")
     if args.month and not 1 <= args.month <= 12:
         raise SystemExit("--month must be between 1 and 12")
+    if args.diff_only and args.refresh:
+        raise SystemExit("--diff-only cannot be used with --refresh")
     if args.year and args.full:
         print("[info] --year is set; ignoring --full and using the year archive scope.")
     if args.remove_feature_image_from_body:
@@ -1593,10 +1763,18 @@ def main() -> None:
         limit = args.limit or 0
     else:
         limit = args.limit or 10
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+    elif args.year:
+        output_dir = Path(f"output{args.year}Diff" if args.diff_only else f"output{args.year}")
+    else:
+        output_dir = Path("outputDiff" if args.diff_only else "output")
+    output_json = Path(args.output) if args.output else output_dir / "ghost-import.json"
+    image_dir = Path(args.image_dir) if args.image_dir else output_dir / "content" / "images"
     config = ExportConfig(
         base_url=args.base_url,
-        output_json=Path(args.output),
-        image_dir=Path(args.image_dir),
+        output_json=output_json,
+        image_dir=image_dir,
         logs_dir=Path(args.logs_dir),
         fetched_file=Path(args.fetched_file),
         dry_run=dry_run,
@@ -1604,9 +1782,11 @@ def main() -> None:
         min_delay=args.min_delay,
         max_delay=max(args.min_delay, args.max_delay),
         max_listing_pages=args.max_listing_pages,
+        max_page_scan=args.max_page_scan,
         timeout=args.timeout,
         download_images=True,
         refresh=args.refresh,
+        diff_only=args.diff_only,
         remove_feature_image_from_body=args.remove_feature_image_from_body,
         remove_duplicate_noscript_images=(
             args.remove_duplicate_noscript_images or args.remove_feature_image_from_body

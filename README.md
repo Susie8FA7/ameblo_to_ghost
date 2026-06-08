@@ -52,6 +52,9 @@ python ameblo_to_ghost.py \
 - `--limit N`: 取得記事数の上限
 - `--full`: 年指定なしで全件探索
 - `--refresh`: `fetched_urls.json` のキャッシュを使わず再取得
+- `--diff-only`: `fetched_urls.json` に存在しない新規記事だけを出力
+- `--output-dir DIR`: `ghost-import.json` と `images_manifest.csv` の出力先ディレクトリ
+- `--max-page-scan N`: 年別/月別補完時に探索する `page-N.html` の上限。デフォルトは500
 - `--author-id`: Ghost user id。`posts[].primary_author_id` と `posts_authors[].author_id` に使用
 - `--author-name`: `data.users` を出力する場合のユーザー名
 - `--author-slug`: `data.users` を出力する場合のユーザーslug
@@ -72,7 +75,44 @@ python ameblo_to_ghost.py \
 - `logs/errors.csv`
 - `fetched_urls.json`
 
+`--year YYYY` 指定時のデフォルト出力先は `outputYYYY/` です。`--diff-only` と併用した場合は `outputYYYYDiff/` へ出力します。
+
 画像はローカルへダウンロードし、本文HTML内の画像パスは `/content/images/YYYY/MM/filename.ext` 形式へ書き換えます。
+
+## 年別取得と差分出力
+
+指定年だけ取得する場合:
+
+```bash
+python ameblo_to_ghost.py \
+  --base-url "https://ameblo.jp/YOUR_AMEBLO_ID/" \
+  --year 2026 \
+  --author-id "YOUR_EXISTING_GHOST_USER_ID" \
+  --no-users \
+  --remove-duplicate-noscript-images
+```
+
+過去に取得済みの記事を除外し、新しく見つかった記事だけを出力する場合:
+
+```bash
+python ameblo_to_ghost.py \
+  --base-url "https://ameblo.jp/YOUR_AMEBLO_ID/" \
+  --year 2026 \
+  --diff-only \
+  --author-id "YOUR_EXISTING_GHOST_USER_ID" \
+  --no-users \
+  --remove-duplicate-noscript-images
+```
+
+`--diff-only` は `--refresh` と併用できません。差分実行中は、`ghost-import.json` の書き出し完了後にだけ `fetched_urls.json` を更新します。中断やタイムアウトでJSONに出ていないURLだけキャッシュが進む状態を避けます。
+
+## page-N補完
+
+Amebloの月別アーカイブ `archive-YYYYMM.html` は20件で打ち切られ、古い同月記事が `page-N.html` 側にしか出ない場合があります。
+
+このツールは、`archive-YYYYMM.html` で指定年月の記事URLがちょうど20件見つかった月だけ、取得済みの指定年月記事URLをアンカーとして `page-N.html` を軽量探索します。アンカーが含まれるページが見つかったら、その周辺 `N-2` から `N+2` だけを補完候補にします。
+
+探索段階では本文をparseせず、一覧HTML内のリンクだけを見ます。候補記事は本文解析後に `published_at` で年/月を確認し、指定範囲外の記事は出力しません。
 
 ## Ghost Import JSON
 
@@ -122,6 +162,7 @@ https://rapi.blogtag.ameba.jp/hashtag/api/v2/article/tag/{blog_id}/{article_id}
 - デフォルトで1〜3秒のアクセス間隔を入れています。
 - 通信失敗時は `429`, `500`, `502`, `503`, `504` を対象に自動リトライします。
 - それでも失敗したURLや画像は `logs/errors.csv` に記録します。
+- 生成するソースコードとREADMEはLF改行を前提にしています。
 
 ## 個人情報の扱い
 
