@@ -1199,7 +1199,7 @@ def convert_ogp_cards_to_links(body: Tag) -> list[str]:
         href = extract_ogp_card_href(card)
         if not href:
             warnings.append("could not convert OGP card: missing href")
-            card.decompose()
+            preserve_ogp_text_as_paragraph(card)
             continue
         title = extract_ogp_card_title(card, href)
         replacement = make_link_paragraph(href, title)
@@ -1218,6 +1218,16 @@ def extract_ogp_card_href(card: Tag) -> str | None:
             if not IMAGE_EXT_RE.search(urlparse(href).path):
                 return href
     return None
+
+
+def preserve_ogp_text_as_paragraph(card: Tag) -> None:
+    text = clean_text(card.get_text(" ", strip=True))
+    if not text:
+        card.decompose()
+        return
+    paragraph = BeautifulSoup(f"<p>{html.escape(text)}</p>", "lxml").find("p")
+    if paragraph:
+        card.replace_with(paragraph)
 
 
 def extract_ogp_card_title(card: Tag, href: str) -> str:
