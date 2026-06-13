@@ -26,7 +26,7 @@ from typing import Iterable
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -76,6 +76,8 @@ class ExportConfig:
     diff_only: bool
     remove_feature_image_from_body: bool
     remove_duplicate_noscript_images: bool
+    improve_news_links: bool
+    ghost_bookmark_cards: bool
     debug_title: bool
     year: int | None
     month: int | None
@@ -98,6 +100,7 @@ class ArticleData:
     hashtags: list[str] = field(default_factory=list)
     feature_image: str | None = None
     slug: str = ""
+    lexical: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "ArticleData":
@@ -115,6 +118,7 @@ class ArticleData:
                 data.get("feature_image") or first_image_from_html(article_html)
             ),
             slug=data.get("slug", ""),
+            lexical=None,
         )
 
     def to_dict(self) -> dict:
@@ -161,6 +165,7 @@ class AmebloExporter:
         self.fetched_urls = self._load_fetched_urls()
         self.article_theme_hints: dict[str, str] = {}
         self.theme_url_set: set[str] = set()
+        self.published_month_hints: dict[str, tuple[int, int] | None] = {}
         self.config.output_json.parent.mkdir(parents=True, exist_ok=True)
         self.config.image_dir.mkdir(parents=True, exist_ok=True)
         self.config.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -168,6 +173,11 @@ class AmebloExporter:
         self._ensure_images_manifest()
 
     def run(self) -> None:
+        if self.config.ghost_bookmark_cards:
+            print(
+                "[bookmark] --ghost-bookmark-cards is enabled; "
+                "eligible links will be emitted as Ghost Lexical bookmark nodes."
+            )
         article_urls = self.discover_article_urls()
         if self.config.limit and not self.config.year:
             article_urls = article_urls[: self.config.limit]
@@ -212,7 +222,9 @@ class AmebloExporter:
 
         ghost_json = self.build_ghost_import(posts)
         self.config.output_json.write_text(
-            json.dumps(ghost_json, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(ghost_json, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+            newline="\n",
         )
         if pending_fetched_updates:
             self.fetched_urls.update(pending_fetched_updates)
@@ -309,6 +321,7 @@ class AmebloExporter:
         article_urls: list[str] = []
         article_seen: set[str] = set()
         scanned_pages: dict[int, list[str]] = {}
+        scanned_page_months: dict[int, set[tuple[int, int]]] = {}
 
         for month in months:
             page = 1
@@ -368,7 +381,7 @@ class AmebloExporter:
                     "archive returned exactly 20 article URLs; page-N anchor scan enabled"
                 )
                 self.discover_chronological_supplement_for_month(
-                    month, month_urls, article_urls, article_seen, scanned_pages
+                    month, month_urls, article_urls, article_seen, scanned_pages, scanned_page_months
                 )
             elif month_urls:
                 print(
@@ -397,40 +410,121 @@ class AmebloExporter:
         article_urls: list[str],
         article_seen: set[str],
         scanned_pages: dict[int, list[str]],
+        scanned_page_months: dict[int, set[tuple[int, int]]],
     ) -> None:
         anchor_set = set(anchor_urls)
-        found = self.find_anchor_page(anchor_set, scanned_pages)
+        found = self.find_anchor_page(anchor_set, scanned_pages, scanned_page_months)
         if not found:
             print(f"[anchor-page] {self.config.year}-{month:02d} not found within {self.config.max_page_scan}")
             return
         anchor_page, anchor_page_urls = found
         print(f"[anchor-page] {self.config.year}-{month:02d} page={anchor_page}")
         start_page = max(1, anchor_page - 2)
-        end_page = min(self.config.max_page_scan, anchor_page + 2)
-        print(f"[supplement-range] {self.config.year}-{month:02d} page-{start_page}..page-{end_page}")
+        print(f"[supplement-range] {self.config.year}-{month:02d} page-{start_page}..month-boundary")
 
         before = len(article_urls)
-        for page in range(start_page, end_page + 1):
+        pages_scanned = 0
+        target_month = (self.config.year, month)
+        for page in range(start_page, anchor_page + 1):
             page_urls = anchor_page_urls if page == anchor_page else self.fetch_chronological_page_urls(
-                page, scanned_pages
+                page, scanned_pages, scanned_page_months
             )
-            for url in page_urls:
-                if url in anchor_set:
-                    continue
-                if url not in article_seen:
-                    article_seen.add(url)
-                    article_urls.append(url)
+            page_months_by_url = self.fetch_published_months_for_urls(page_urls)
+            pages_scanned += 1
+            self.add_supplement_page_urls(
+                [url for url in page_urls if page_months_by_url.get(url) == target_month],
+                anchor_set,
+                article_urls,
+                article_seen,
+            )
+
+        page = anchor_page + 1
+        while page <= self.config.max_page_scan:
+            page_urls = self.fetch_chronological_page_urls(page, scanned_pages, scanned_page_months)
+            if not page_urls:
+                print(f"[supplement-stop] {self.config.year}-{month:02d} page={page} empty")
+                break
+            page_months_by_url = self.fetch_published_months_for_urls(page_urls)
+            page_months = {item for item in page_months_by_url.values() if item is not None}
+            has_target_month = target_month in page_months
+            month_summary = ",".join(f"{year}-{item_month:02d}" for year, item_month in sorted(page_months))
+            if has_target_month:
+                print(
+                    f"[supplement-scan] {self.config.year}-{month:02d} "
+                    f"page={page} published_months={month_summary or 'unknown'} target_month=yes"
+                )
+                self.add_supplement_page_urls(
+                    [url for url in page_urls if page_months_by_url.get(url) == target_month],
+                    anchor_set,
+                    article_urls,
+                    article_seen,
+                )
+                pages_scanned += 1
+                page += 1
+                continue
+            if not page_months:
+                print(
+                    f"[supplement-scan] {self.config.year}-{month:02d} "
+                    f"page={page} published_months=unknown target_month=unknown"
+                )
+                pages_scanned += 1
+                print(f"[supplement-stop] {self.config.year}-{month:02d} page={page} published-month-unknown")
+                break
+            print(
+                f"[supplement-stop] {self.config.year}-{month:02d} "
+                f"page={page} published_months={month_summary} target_month=no"
+            )
+            break
         added = len(article_urls) - before
-        print(f"[supplement-candidates] {self.config.year}-{month:02d} added={added}")
+        print(f"[supplement-candidates] {self.config.year}-{month:02d} pages={pages_scanned} added={added}")
+
+    @staticmethod
+    def add_supplement_page_urls(
+        page_urls: list[str],
+        anchor_set: set[str],
+        article_urls: list[str],
+        article_seen: set[str],
+    ) -> None:
+        for url in page_urls:
+            if url in anchor_set:
+                continue
+            if url not in article_seen:
+                article_seen.add(url)
+                article_urls.append(url)
+
+    def fetch_published_months_for_urls(self, urls: list[str]) -> dict[str, tuple[int, int] | None]:
+        return {url: self.fetch_article_published_month(url) for url in urls}
+
+    def fetch_article_published_month(self, url: str) -> tuple[int, int] | None:
+        if url in self.published_month_hints:
+            return self.published_month_hints[url]
+        cached = self.fetched_urls.get(url)
+        if isinstance(cached, dict) and cached.get("published_at"):
+            month = published_month_from_iso(str(cached.get("published_at")))
+            self.published_month_hints[url] = month
+            return month
+        try:
+            soup = self.fetch_soup(url)
+            published_at = self.extract_published_at(soup)
+        except Exception as exc:  # noqa: BLE001
+            self.log_error(url, "published_month_fetch_failed", str(exc))
+            self.published_month_hints[url] = None
+            return None
+        month = published_month_from_iso(published_at or "")
+        self.published_month_hints[url] = month
+        return month
 
     def find_anchor_page(
-        self, anchor_urls: set[str], scanned_pages: dict[int, list[str]]
+        self,
+        anchor_urls: set[str],
+        scanned_pages: dict[int, list[str]],
+        scanned_page_months: dict[int, set[tuple[int, int]]],
     ) -> tuple[int, list[str]] | None:
         last_anchor_page: int | None = None
         last_anchor_page_urls: list[str] = []
         stop_after_pages_without_anchor = 5
         for page in range(1, self.config.max_page_scan + 1):
-            page_urls = self.fetch_chronological_page_urls(page, scanned_pages)
+            page_urls = self.fetch_chronological_page_urls(page, scanned_pages, scanned_page_months)
             if not page_urls:
                 continue
             has_anchor = any(url in anchor_urls for url in page_urls)
@@ -443,7 +537,12 @@ class AmebloExporter:
             return None
         return last_anchor_page, last_anchor_page_urls
 
-    def fetch_chronological_page_urls(self, page: int, scanned_pages: dict[int, list[str]]) -> list[str]:
+    def fetch_chronological_page_urls(
+        self,
+        page: int,
+        scanned_pages: dict[int, list[str]],
+        scanned_page_months: dict[int, set[tuple[int, int]]] | None = None,
+    ) -> list[str]:
         if page in scanned_pages:
             return scanned_pages[page]
         listing_url = urljoin(self.config.base_url, "" if page == 1 else f"page-{page}.html")
@@ -473,6 +572,8 @@ class AmebloExporter:
                 page_urls.append(canonical_article_url(normalized))
         unique_page_urls = list(dict.fromkeys(page_urls))
         scanned_pages[page] = unique_page_urls
+        if scanned_page_months is not None:
+            scanned_page_months[page] = extract_listing_month_markers(soup)
         return unique_page_urls
 
     def discover_theme_urls_from_index(self) -> None:
@@ -553,8 +654,14 @@ class AmebloExporter:
         if not theme:
             theme = self.article_theme_hints.get(url)
         body = self.extract_body(soup)
-        for warning in remove_image_card_blocks(body):
+        warnings = remove_image_card_blocks(body, convert_ogp_cards=not self.config.ghost_bookmark_cards)
+        for warning in warnings:
             self.log_error(url, "warning", warning)
+        if self.config.improve_news_links:
+            improve_news_digest_links(body, title)
+        if self.config.ghost_bookmark_cards:
+            for warning in convert_reachable_links_to_bookmark_placeholders(body, title, self):
+                self.log_error(url, "warning", warning)
         api_hashtags = self.fetch_hashtags_from_api(url)
         hashtags = merge_unique(api_hashtags, self.extract_hashtags(soup))
         if theme:
@@ -570,7 +677,22 @@ class AmebloExporter:
         feature_image_node = find_feature_image_tag(body)
         feature_image = image_src(feature_image_node)
         append_source_link(body, url)
-        body_html = str(body)
+        lexical = None
+        if self.config.ghost_bookmark_cards and body.find(attrs={"data-ghost-bookmark-url": True}):
+            if body.find("img"):
+                for placeholder in body.find_all(attrs={"data-ghost-bookmark-url": True}):
+                    placeholder.replace_with(
+                        make_link_paragraph(
+                            str(placeholder.get("data-ghost-bookmark-url") or ""),
+                            str(placeholder.get("data-ghost-bookmark-title") or ""),
+                        )
+                    )
+                body_html = str(body)
+            else:
+                lexical = build_lexical_from_body(body)
+                body_html = ""
+        else:
+            body_html = str(body)
         if self.config.remove_duplicate_noscript_images:
             if body.find("noscript"):
                 message = "noscript remains in body html"
@@ -588,6 +710,7 @@ class AmebloExporter:
             hashtags=hashtags,
             feature_image=feature_image,
             slug=slug,
+            lexical=lexical,
         )
 
     def fetch_soup(self, url: str) -> BeautifulSoup:
@@ -595,6 +718,62 @@ class AmebloExporter:
         response.raise_for_status()
         response.encoding = response.apparent_encoding or response.encoding
         return BeautifulSoup(response.text, "lxml")
+
+    def is_reachable_url(self, url: str) -> bool:
+        if not hasattr(self, "_reachable_url_cache"):
+            self._reachable_url_cache = {}
+        cache: dict[str, bool] = self._reachable_url_cache
+        if url in cache:
+            return cache[url]
+        try:
+            response = self.session.head(url, timeout=self.config.timeout, allow_redirects=True)
+            if response.status_code in {403, 405} or response.status_code >= 400:
+                response = self.session.get(url, timeout=self.config.timeout, allow_redirects=True, stream=True)
+            reachable = 200 <= response.status_code < 400
+            response.close()
+        except requests.RequestException:
+            reachable = False
+        cache[url] = reachable
+        return reachable
+
+    def fetch_bookmark_metadata(self, url: str, fallback_title: str = "") -> dict:
+        if not hasattr(self, "_bookmark_metadata_cache"):
+            self._bookmark_metadata_cache = {}
+        cache: dict[str, dict] = self._bookmark_metadata_cache
+        if url in cache:
+            return cache[url]
+        metadata = default_bookmark_metadata(url, fallback_title)
+        try:
+            response = self.session.get(url, timeout=self.config.timeout, allow_redirects=True)
+            response.raise_for_status()
+            response.encoding = response.apparent_encoding or response.encoding
+        except Exception:  # noqa: BLE001
+            cache[url] = metadata
+            return metadata
+        soup = BeautifulSoup(response.text, "lxml")
+        title = first_meta_content(soup, ["og:title", "twitter:title"]) or clean_text(
+            soup.title.get_text(" ", strip=True) if soup.title else ""
+        )
+        description = first_meta_content(
+            soup,
+            ["og:description", "twitter:description", "description"],
+        )
+        publisher = first_meta_content(soup, ["og:site_name", "application-name"])
+        author = first_meta_content(soup, ["author", "article:author"])
+        thumbnail = first_meta_content(soup, ["og:image", "twitter:image", "twitter:image:src"])
+        icon = find_page_icon(soup, response.url)
+        metadata.update(
+            {
+                "icon": icon,
+                "title": title or fallback_title or url,
+                "description": description,
+                "publisher": publisher,
+                "author": author,
+                "thumbnail": urljoin(response.url, thumbnail) if thumbnail else None,
+            }
+        )
+        cache[url] = metadata
+        return metadata
 
     def sleep(self) -> None:
         delay = random.uniform(self.config.min_delay, self.config.max_delay)
@@ -893,6 +1072,8 @@ class AmebloExporter:
                     "canonical_url": article.url,
                 }
             )
+            if article.lexical:
+                posts[-1]["lexical"] = article.lexical
             posts_authors.append({"post_id": post_id, "author_id": author_id, "sort_order": 0})
             tag_names: list[tuple[str, str]] = []
             if article.theme:
@@ -1166,8 +1347,8 @@ def append_source_link(body: Tag, article_url: str) -> None:
         body.append(node)
 
 
-def remove_image_card_blocks(body: Tag) -> list[str]:
-    warnings = convert_ogp_cards_to_links(body)
+def remove_image_card_blocks(body: Tag, convert_ogp_cards: bool = True) -> list[str]:
+    warnings = convert_ogp_cards_to_links(body) if convert_ogp_cards else []
 
     card_class_patterns = (
         "kg-card",
@@ -1184,6 +1365,308 @@ def remove_image_card_blocks(body: Tag) -> list[str]:
         for node in body.find_all(attrs={attr: True}):
             node.decompose()
     return warnings
+
+
+def convert_reachable_links_to_bookmark_placeholders(
+    body: Tag, title: str, exporter: "AmebloExporter"
+) -> list[str]:
+    warnings: list[str] = []
+    warnings.extend(convert_ogp_cards_to_bookmark_placeholders(body, exporter))
+    if is_news_digest_title(title):
+        warnings.extend(convert_news_digest_links_to_bookmark_placeholders(body, exporter))
+    prune_duplicate_consecutive_links(body)
+    return warnings
+
+
+def convert_ogp_cards_to_bookmark_placeholders(body: Tag, exporter: "AmebloExporter") -> list[str]:
+    warnings: list[str] = []
+    candidates = list(
+        body.find_all(class_=lambda value: class_list_contains(value, {"ogpCard_root", "ogpCard_wrap"}))
+    )
+    for card in candidates:
+        if not card.parent:
+            continue
+        if card.find_parent(class_=lambda value: class_list_contains(value, {"ogpCard_root", "ogpCard_wrap"})):
+            continue
+        href = extract_ogp_card_href(card)
+        if not href:
+            warnings.append("could not bookmark OGP card: missing href")
+            continue
+        title = extract_ogp_card_title_or_none(card, href)
+        if not title:
+            warnings.append(f"could not bookmark OGP card: missing title: {href}")
+            continue
+        if not exporter.is_reachable_url(href):
+            warnings.append(f"could not bookmark OGP card: unreachable url: {href}")
+            continue
+        metadata = extract_ogp_card_metadata(card, href, title)
+        card.replace_with(make_bookmark_placeholder(href, metadata))
+    return warnings
+
+
+def convert_news_digest_links_to_bookmark_placeholders(body: Tag, exporter: "AmebloExporter") -> list[str]:
+    warnings: list[str] = []
+    for paragraph in list(body.find_all("p")):
+        direct_text = "".join(str(text) for text in paragraph.find_all(string=True, recursive=False)).lstrip()
+        if not direct_text.startswith("-"):
+            continue
+        anchors = paragraph.find_all("a", href=True)
+        if len(anchors) != 1:
+            continue
+        anchor = anchors[0]
+        href = str(anchor.get("href") or "").strip()
+        title = clean_text(anchor.get_text(" ", strip=True))
+        if not href or not title:
+            warnings.append("could not bookmark news link: missing href or title")
+            continue
+        if not exporter.is_reachable_url(href):
+            warnings.append(f"could not bookmark news link: unreachable url: {href}")
+            continue
+        paragraph.replace_with(make_bookmark_placeholder(href, exporter.fetch_bookmark_metadata(href, title)))
+    warnings.extend(convert_bare_news_digest_links_to_bookmark_placeholders(body, exporter))
+    return warnings
+
+
+def convert_bare_news_digest_links_to_bookmark_placeholders(body: Tag, exporter: "AmebloExporter") -> list[str]:
+    warnings: list[str] = []
+    for anchor in list(body.find_all("a", href=True)):
+        if anchor.find_parent(attrs={"data-ghost-bookmark-url": True}):
+            continue
+        previous_text = previous_text_sibling(anchor)
+        if not previous_text or not text_ends_with_dash_marker(str(previous_text)):
+            continue
+        href = str(anchor.get("href") or "").strip()
+        title = clean_text(anchor.get_text(" ", strip=True))
+        if not href or not title:
+            warnings.append("could not bookmark bare news link: missing href or title")
+            continue
+        if not exporter.is_reachable_url(href):
+            warnings.append(f"could not bookmark bare news link: unreachable url: {href}")
+            continue
+        previous_text.replace_with(NavigableString(remove_trailing_dash_marker(str(previous_text))))
+        anchor.replace_with(make_bookmark_placeholder(href, exporter.fetch_bookmark_metadata(href, title)))
+    return warnings
+
+
+def previous_text_sibling(node: Tag) -> NavigableString | None:
+    sibling = node.previous_sibling
+    while sibling is not None:
+        if isinstance(sibling, NavigableString):
+            if str(sibling).strip():
+                return sibling
+        elif isinstance(sibling, Tag) and sibling.name != "br":
+            return None
+        sibling = sibling.previous_sibling
+    return None
+
+
+def text_ends_with_dash_marker(value: str) -> bool:
+    return bool(re.search(r"(^|[\r\n])\s*-\s*$", value))
+
+
+def remove_trailing_dash_marker(value: str) -> str:
+    return re.sub(r"(^|[\r\n])(\s*)-\s*$", r"\1\2", value, count=1)
+
+
+def make_bookmark_placeholder(href: str, metadata: dict) -> Tag:
+    metadata_value = html.escape(
+        json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+        quote=True,
+    )
+    fragment = BeautifulSoup(
+        (
+            f'<div data-ghost-bookmark-url="{html.escape(href, quote=True)}" '
+            f'data-ghost-bookmark-title="{html.escape(str(metadata.get("title") or href), quote=True)}" '
+            f'data-ghost-bookmark-metadata="{metadata_value}"></div>'
+        ),
+        "lxml",
+    )
+    return fragment.find("div") or fragment
+
+
+def build_lexical_from_body(body: Tag) -> str:
+    children: list[dict] = []
+    paragraph_buffer: list[dict] = []
+    append_lexical_children_from_container(body, children, paragraph_buffer)
+    flush_lexical_paragraph(children, paragraph_buffer)
+    return json.dumps(
+        {
+            "root": {
+                "children": children,
+                "direction": "ltr",
+                "format": "",
+                "indent": 0,
+                "type": "root",
+                "version": 1,
+            }
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def append_lexical_children_from_container(
+    container: Tag, children: list[dict], paragraph_buffer: list[dict]
+) -> None:
+    for child in list(container.contents):
+        if isinstance(child, NavigableString):
+            append_text_node(paragraph_buffer, str(child))
+            continue
+        if not isinstance(child, Tag):
+            continue
+        if child.has_attr("data-ghost-bookmark-url"):
+            flush_lexical_paragraph(children, paragraph_buffer)
+            children.append(make_lexical_bookmark_node_from_placeholder(child))
+            continue
+        if child.name == "br":
+            flush_lexical_paragraph(children, paragraph_buffer)
+            continue
+        if child.name == "hr":
+            flush_lexical_paragraph(children, paragraph_buffer)
+            continue
+        if child.name in {"p", "div", "section", "article"}:
+            if child.find(attrs={"data-ghost-bookmark-url": True}) or child.find(["p", "div"]):
+                flush_lexical_paragraph(children, paragraph_buffer)
+                append_lexical_children_from_container(child, children, paragraph_buffer)
+                flush_lexical_paragraph(children, paragraph_buffer)
+            else:
+                inline_nodes = inline_lexical_nodes(child)
+                if inline_nodes:
+                    flush_lexical_paragraph(children, paragraph_buffer)
+                    children.append(make_lexical_paragraph(inline_nodes))
+            continue
+        inline_nodes = inline_lexical_nodes(child)
+        if inline_nodes:
+            paragraph_buffer.extend(inline_nodes)
+
+
+def inline_lexical_nodes(node: Tag) -> list[dict]:
+    nodes: list[dict] = []
+    for child in node.contents:
+        if isinstance(child, NavigableString):
+            append_text_node(nodes, str(child))
+        elif isinstance(child, Tag):
+            if child.name == "br":
+                append_text_node(nodes, "\n")
+            elif child.name == "a" and child.get("href"):
+                link_children: list[dict] = []
+                for item in child.contents:
+                    if isinstance(item, NavigableString):
+                        append_text_node(link_children, str(item))
+                    elif isinstance(item, Tag):
+                        append_text_node(link_children, item.get_text(" ", strip=True))
+                if not link_children:
+                    append_text_node(link_children, str(child.get("href") or ""))
+                nodes.append(make_lexical_link(str(child.get("href") or ""), link_children))
+            elif child.name not in {"script", "style", "noscript"}:
+                nodes.extend(inline_lexical_nodes(child))
+    compact_text_nodes(nodes)
+    return nodes
+
+
+def append_text_node(nodes: list[dict], value: str) -> None:
+    if not value:
+        return
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    if not value.strip():
+        if nodes and nodes[-1].get("type") == "text" and not str(nodes[-1].get("text", "")).endswith(" "):
+            nodes[-1]["text"] = str(nodes[-1].get("text", "")) + " "
+        return
+    nodes.append(make_lexical_text(clean_inline_text(value)))
+
+
+def clean_inline_text(value: str) -> str:
+    value = re.sub(r"[ \t\f\v]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
+
+
+def compact_text_nodes(nodes: list[dict]) -> None:
+    compacted: list[dict] = []
+    for node in nodes:
+        if node.get("type") == "text" and compacted and compacted[-1].get("type") == "text":
+            compacted[-1]["text"] = str(compacted[-1].get("text", "")) + str(node.get("text", ""))
+        else:
+            compacted.append(node)
+    nodes[:] = compacted
+
+
+def flush_lexical_paragraph(children: list[dict], paragraph_buffer: list[dict]) -> None:
+    compact_text_nodes(paragraph_buffer)
+    has_text = any(clean_text(str(node.get("text", ""))) for node in paragraph_buffer if node.get("type") == "text")
+    has_link = any(node.get("type") == "link" for node in paragraph_buffer)
+    if paragraph_buffer and (has_text or has_link):
+        children.append(make_lexical_paragraph(list(paragraph_buffer)))
+    paragraph_buffer.clear()
+
+
+def make_lexical_paragraph(nodes: list[dict]) -> dict:
+    return {
+        "children": nodes,
+        "direction": "ltr",
+        "format": "",
+        "indent": 0,
+        "type": "paragraph",
+        "version": 1,
+    }
+
+
+def make_lexical_text(value: str) -> dict:
+    return {
+        "detail": 0,
+        "format": 0,
+        "mode": "normal",
+        "style": "",
+        "text": value,
+        "type": "text",
+        "version": 1,
+    }
+
+
+def make_lexical_link(url: str, children: list[dict]) -> dict:
+    return {
+        "children": children,
+        "direction": "ltr",
+        "format": "",
+        "indent": 0,
+        "type": "link",
+        "rel": None,
+        "target": None,
+        "title": None,
+        "url": url,
+        "version": 1,
+    }
+
+
+def make_lexical_bookmark_node_from_placeholder(node: Tag) -> dict:
+    href = str(node.get("data-ghost-bookmark-url") or "")
+    metadata_value = str(node.get("data-ghost-bookmark-metadata") or "")
+    metadata = default_bookmark_metadata(href, str(node.get("data-ghost-bookmark-title") or ""))
+    if metadata_value:
+        try:
+            loaded = json.loads(html.unescape(metadata_value))
+            if isinstance(loaded, dict):
+                metadata.update(loaded)
+        except json.JSONDecodeError:
+            pass
+    return make_lexical_bookmark_node(href, metadata)
+
+
+def make_lexical_bookmark_node(href: str, metadata: dict) -> dict:
+    return {
+        "type": "bookmark",
+        "version": 1,
+        "url": href,
+        "metadata": {
+            "icon": metadata.get("icon"),
+            "title": metadata.get("title") or href,
+            "description": metadata.get("description"),
+            "author": metadata.get("author"),
+            "publisher": metadata.get("publisher"),
+            "thumbnail": metadata.get("thumbnail"),
+        },
+        "caption": "",
+    }
 
 
 def convert_ogp_cards_to_links(body: Tag) -> list[str]:
@@ -1231,6 +1714,10 @@ def preserve_ogp_text_as_paragraph(card: Tag) -> None:
 
 
 def extract_ogp_card_title(card: Tag, href: str) -> str:
+    return extract_ogp_card_title_or_none(card, href) or href
+
+
+def extract_ogp_card_title_or_none(card: Tag, href: str) -> str | None:
     title_selectors = [
         ".ogpCard_title",
         ".ogpCardTitle",
@@ -1249,7 +1736,101 @@ def extract_ogp_card_title(card: Tag, href: str) -> str:
             value = clean_text(anchor.get_text(" ", strip=True))
             if value and value != href:
                 return value
-    return href
+    return None
+
+
+def extract_ogp_card_metadata(card: Tag, href: str, title: str) -> dict:
+    metadata = default_bookmark_metadata(href, title)
+    metadata.update(
+        {
+            "description": first_selector_text(
+                card,
+                [".ogpCard_description", ".ogpCardDescription", ".ogpCard_summary"],
+            ),
+            "publisher": first_selector_text(
+                card,
+                [
+                    ".ogpCard_site",
+                    ".ogpCardSite",
+                    ".ogpCard_urlText",
+                    ".ogpCardUrlText",
+                    ".ogpCard_url",
+                    ".ogpCardUrl",
+                ],
+            ),
+            "thumbnail": first_card_image_url(card),
+        }
+    )
+    return metadata
+
+
+def default_bookmark_metadata(url: str, title: str = "") -> dict:
+    return {
+        "icon": None,
+        "title": title or url,
+        "description": None,
+        "publisher": None,
+        "author": None,
+        "thumbnail": None,
+    }
+
+
+def first_selector_text(node: Tag, selectors: list[str]) -> str | None:
+    for selector in selectors:
+        candidate = node.select_one(selector)
+        if not candidate:
+            continue
+        value = clean_text(candidate.get_text(" ", strip=True))
+        if value:
+            return value
+    return None
+
+
+def first_card_image_url(card: Tag) -> str | None:
+    for selector in [".ogpCard_image", ".ogpCardImage", "[data-ogp-card-image]"]:
+        for img in card.select(selector):
+            for attr in ("src", "data-src"):
+                value = str(img.get(attr) or "").strip()
+                if value and not value.lower().endswith(".svg"):
+                    return value
+    for img in card.find_all("img"):
+        classes = set(img.get("class", []))
+        if classes.intersection({"ogpCard_icon", "ogpCardIcon"}):
+            continue
+        for attr in ("src", "data-src", "data-ogp-card-image"):
+            value = str(img.get(attr) or "").strip()
+            if value and not value.lower().endswith(".svg"):
+                return value
+    for node in card.find_all(attrs={"style": True}):
+        match = re.search(r"url\((['\"]?)(.*?)\1\)", str(node.get("style") or ""))
+        if match and match.group(2):
+            return match.group(2)
+    return None
+
+
+def first_meta_content(soup: BeautifulSoup, names: list[str]) -> str | None:
+    for name in names:
+        selectors = [
+            f'meta[property="{name}"]',
+            f'meta[name="{name}"]',
+        ]
+        for selector in selectors:
+            node = soup.select_one(selector)
+            if not node:
+                continue
+            value = clean_text(str(node.get("content") or ""))
+            if value:
+                return value
+    return None
+
+
+def find_page_icon(soup: BeautifulSoup, base_url: str) -> str | None:
+    rel_candidates = ("icon", "shortcut icon", "apple-touch-icon")
+    for link in soup.find_all("link", href=True):
+        rel = " ".join(link.get("rel", [])).lower()
+        if rel in rel_candidates or any(item in rel.split() for item in rel_candidates):
+            return urljoin(base_url, str(link.get("href") or ""))
+    return urljoin(base_url, "/favicon.ico")
 
 
 def make_link_paragraph(href: str, text: str) -> Tag:
@@ -1283,6 +1864,55 @@ def prune_duplicate_consecutive_links(body: Tag) -> None:
             previous_href = href
         elif text:
             previous_href = None
+
+
+def extract_listing_month_markers(soup: BeautifulSoup) -> set[tuple[int, int]]:
+    text = soup.get_text("\n", strip=True)
+    months: set[tuple[int, int]] = set()
+    patterns = [
+        r"(20\d{2})[/-](\d{1,2})[/-]\d{1,2}",
+        r"(20\d{2})年\s*(\d{1,2})月",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            year = int(match.group(1))
+            month = int(match.group(2))
+            if 1 <= month <= 12:
+                months.add((year, month))
+    return months
+
+
+def improve_news_digest_links(body: Tag, title: str) -> None:
+    if not is_news_digest_title(title):
+        return
+    replace_line_initial_japanese_bullets(body)
+    for node in body.find_all(["p", "div"]):
+        replace_leading_japanese_bullet(node)
+
+
+def is_news_digest_title(title: str) -> bool:
+    return "のあれやこれや" in clean_text(title)
+
+
+def replace_leading_japanese_bullet(node: Tag) -> None:
+    for descendant in node.descendants:
+        if not isinstance(descendant, NavigableString):
+            continue
+        text = str(descendant)
+        if not text.strip():
+            continue
+        replaced = re.sub(r"^(\s*)・\s*", r"\1- ", text, count=1)
+        if replaced != text:
+            descendant.replace_with(NavigableString(replaced))
+        return
+
+
+def replace_line_initial_japanese_bullets(body: Tag) -> None:
+    for text_node in list(body.find_all(string=True)):
+        text = str(text_node)
+        replaced = re.sub(r"(^|[\r\n])(\s*)・\s*", r"\1\2- ", text)
+        if replaced != text:
+            text_node.replace_with(NavigableString(replaced))
 
 
 def remove_article_chrome(body: Tag) -> None:
@@ -1473,6 +2103,8 @@ def prune_empty_containers(body: Tag) -> None:
     while changed:
         changed = False
         for node in list(body.find_all(["p", "div", "a", "noscript"])):
+            if node.has_attr("data-ghost-bookmark-url"):
+                continue
             if node.find(["img", "video", "iframe", "embed"]):
                 continue
             if node.get_text(strip=True):
@@ -1653,6 +2285,25 @@ def parse_datetime(value: str) -> str | None:
         return None
 
 
+def published_month_from_iso(value: str) -> tuple[int, int] | None:
+    value = clean_text(value)
+    if not value:
+        return None
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+        return parsed.year, parsed.month
+    except ValueError:
+        pass
+    match = re.search(r"(20\d{2})[/-](\d{1,2})[/-]\d{1,2}", value)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    match = re.search(r"(20\d{2})年\s*(\d{1,2})月\s*\d{1,2}日", value)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return None
+
+
 def make_slug(url: str, title: str, published_at: str | None) -> str:
     entry_match = re.search(r"entry-(\d+)\.html", url)
     if entry_match:
@@ -1741,6 +2392,19 @@ def parse_args() -> argparse.Namespace:
         help="Remove Ameblo noscript image duplicates while keeping normal body img tags.",
     )
     parser.add_argument(
+        "--improve-news-links",
+        action="store_true",
+        help="For news digest posts, convert leading Japanese link bullets from ・ to -.",
+    )
+    parser.add_argument(
+        "--ghost-bookmark-cards",
+        action="store_true",
+        help=(
+            "Convert eligible news/OGP links to Ghost Lexical bookmark nodes. "
+            "Posts with bookmark nodes are emitted through posts[].lexical only."
+        ),
+    )
+    parser.add_argument(
         "--debug-title",
         action="store_true",
         help="Print title candidates and the selected title for each fetched article.",
@@ -1801,6 +2465,8 @@ def main() -> None:
         remove_duplicate_noscript_images=(
             args.remove_duplicate_noscript_images or args.remove_feature_image_from_body
         ),
+        improve_news_links=args.improve_news_links,
+        ghost_bookmark_cards=args.ghost_bookmark_cards,
         debug_title=args.debug_title,
         year=args.year,
         month=args.month,

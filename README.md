@@ -1,200 +1,214 @@
-# Ameblo to Ghost Import JSON
+# Ameblo to Ghost Exporter
 
-Python `requests` + `BeautifulSoup4` でAmebloの公開記事を取得し、Ghost 5.x Import JSONを生成するツールです。
+`requests` と `BeautifulSoup4` で Ameblo の公開記事を取得し、Ghost CMS の Import JSON を生成するツールです。
 
-このリリース版では、Amebloアカウント名やGhostユーザーIDなどの個人依存値はコード内に固定していません。実行時にオプションで指定してください。
+対象ブログは `--base-url` で指定できます。
+
+```text
+https://ameblo.jp/YOUR_AMEBLO_ID/
+```
 
 ## セットアップ
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
+. .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Windows PowerShellの場合:
+## dry-run
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-## 最小実行例
+デフォルトは dry-run として最大10記事だけ取得します。
 
 ```bash
-python ameblo_to_ghost.py \
-  --base-url "https://ameblo.jp/YOUR_AMEBLO_ID/" \
-  --year 2026 \
-  --author-id "YOUR_GHOST_USER_ID" \
-  --author-name "Your Name" \
-  --author-slug "your-name" \
-  --author-email "your-name@example.invalid" \
-  --remove-duplicate-noscript-images
+python ameblo_to_ghost.py
 ```
 
-既存Ghostユーザーへ紐付け、Import JSONに `data.users` を含めない場合:
+出力:
+
+```text
+output/ghost-import.json
+output/content/images/YYYY/MM/
+output/images_manifest.csv
+logs/errors.csv
+fetched_urls.json
+```
+
+## 全件取得
+
+公開済み記事を全件取得する場合:
 
 ```bash
-python ameblo_to_ghost.py \
-  --base-url "https://ameblo.jp/YOUR_AMEBLO_ID/" \
-  --year 2026 \
-  --author-id "YOUR_EXISTING_GHOST_USER_ID" \
-  --no-users \
-  --remove-duplicate-noscript-images
+python ameblo_to_ghost.py --full
 ```
 
-## 主なオプション
+別ブログを対象にする場合:
 
-- `--base-url`: 対象AmebloブログURL。例: `https://ameblo.jp/YOUR_AMEBLO_ID/`
-- `--year YYYY`: 指定年の月別アーカイブを12月から1月へ処理
-- `--month MM`: `--year` と併用し、指定月だけ取得
-- `--limit N`: 取得記事数の上限
-- `--full`: 年指定なしで全件探索
-- `--refresh`: `fetched_urls.json` のキャッシュを使わず再取得
-- `--diff-only`: `fetched_urls.json` に存在しない新規記事だけを出力
-- `--output-dir DIR`: `ghost-import.json` と `images_manifest.csv` の出力先ディレクトリ
-- `--max-page-scan N`: 年別/月別補完時に探索する `page-N.html` の上限。デフォルトは500
-- `--author-id`: Ghost user id。`posts[].primary_author_id` と `posts_authors[].author_id` に使用
-- `--author-name`: `data.users` を出力する場合のユーザー名
-- `--author-slug`: `data.users` を出力する場合のユーザーslug
-- `--author-email`: `data.users` を出力する場合のメールアドレス
-- `--no-users`: `data.users` を出力せず、既存GhostユーザーIDへ紐付け
-- `--remove-duplicate-noscript-images`: Ameblo画像ブロック内の重複 `noscript` 画像を削除
-- `--debug-title`: タイトル候補と採用タイトルをログ出力
+```bash
+python ameblo_to_ghost.py --base-url https://ameblo.jp/YOUR_AMEBLO_ID/ --full
+```
+
+アクセス間隔はデフォルトで1〜3秒です。変更する場合:
+
+```bash
+python ameblo_to_ghost.py --full --min-delay 1.5 --max-delay 3.5
+```
+
+通信失敗時は `429`, `500`, `502`, `503`, `504` を対象に自動リトライします。それでも失敗したURLは `logs/errors.csv` に記録されます。
+
+## 年別取得
+
+指定した年の記事だけを月別アーカイブから取得する場合:
+
+```bash
+python ameblo_to_ghost.py --year 2026 --remove-duplicate-noscript-images
+```
+
+`--year` 指定時は `archive-YYYYMM.html` を使い、12月から1月へ新しい月順に処理します。投稿数が多い月は `archive-YYYYMM-2.html`, `archive-YYYYMM-3.html` のような2ページ目以降も巡回します。
+
+Ameblo側で月別アーカイブの2ページ目が存在しない場合に備えて、通常の時系列一覧 `page-N.html` も補完巡回します。Amebloの月別アーカイブは20件で打ち切られ、古い同月記事が `page-N.html` 側にしか出ない場合があります。そのため、`archive-YYYYMM.html` で指定年月の記事URLがちょうど20件見つかった月だけ、取得済みの指定年月記事URLをアンカーにして `page-N.html` を軽量探索します。
+
+アンカーが含まれる `page-N.html` が見つかったら、その周辺 `N-2` から `N+2` だけを補完候補にします。この探索段階では記事本文を解析せず、一覧HTML内のリンクだけを見ます。候補記事は本文解析後に `published_at` で年/月を確認し、指定範囲外の記事は出力しません。
+
+`page-N.html` の探索上限は `--max-page-scan` で変更できます。デフォルトは500です。
+
+```bash
+python ameblo_to_ghost.py --year 2020 --diff-only --max-page-scan 500 --remove-duplicate-noscript-images
+```
+
+存在しない月や記事がない月はスキップします。`--limit` 未指定ならその年の全件を対象にし、`--limit` を指定した場合だけ上限件数を適用します。
+
+年別取得のデフォルト出力先は `outputYYYY/` です。例として `--year 2026` の場合は `output2026/ghost-import.json` と `output2026/content/images/YYYY/MM/` に出力します。出力先を変えたい場合は `--output-dir` を指定します。
+
+```bash
+python ameblo_to_ghost.py --year 2026 --output-dir output2026Retry --remove-duplicate-noscript-images
+```
+
+既存Ghostユーザーへ紐付け、`data.users` をImport JSONに含めない場合:
+
+```bash
+python ameblo_to_ghost.py --year 2026 --remove-duplicate-noscript-images --author-id REPLACE_WITH_EXISTING_GHOST_AUTHOR_ID --no-users
+```
+
+特定月だけ取得する場合:
+
+```bash
+python ameblo_to_ghost.py --year 2026 --month 6 --remove-duplicate-noscript-images
+```
+
+`--full` と `--year` を同時に指定した場合は、`--year` の範囲を優先します。
+
+## 再開
+
+取得済みURLは `fetched_urls.json` に保存されます。同じURLは次回実行時にスキップされます。
+
+キャッシュを無視して取り直したい場合:
+
+```bash
+python ameblo_to_ghost.py --refresh
+```
+
+完全にやり直したい場合は `fetched_urls.json` を退避または削除してください。
+
+## 差分出力
+
+過去に取得済みの記事を除外し、新しく見つかった記事だけをGhost Import JSONに出力したい場合:
+
+```bash
+python ameblo_to_ghost.py --year 2020 --diff-only --remove-duplicate-noscript-images --no-users
+```
+
+`--diff-only` 指定時は `fetched_urls.json` に存在するURLを完全にスキップし、`[skip-existing]` とログ出力します。新規URLだけを取得・解析し、`fetched_urls.json` に追加します。`--year` と併用した場合のデフォルト出力先は `outputYYYYDiff/` です。新規記事が0件でも、空のGhost Import JSONを出力します。
+
+`--diff-only` と `--refresh` は同時指定できません。差分出力先を明示したい場合は `--output-dir` を使います。
+
+```bash
+python ameblo_to_ghost.py --year 2020 --diff-only --output-dir output2020Diff --remove-duplicate-noscript-images --no-users
+```
+
+## 画像
+
+本文内画像は `output/content/images/YYYY/MM/` に保存され、本文HTML内の `img src` は `/content/images/YYYY/MM/filename.ext` のようなGhost向けパスへ書き換えます。
+
+画像は必ずダウンロードを試みます。元URLと保存先の対応は `output/images_manifest.csv` に出力されます。
+
+本文内の通常 `<img>` は削除しません。Ameblo由来の `<noscript><img ...></noscript>` 重複だけを削除したい場合:
+
+```bash
+python ameblo_to_ghost.py --remove-duplicate-noscript-images
+```
+
+このオプションを指定した場合、本文内の通常 `<img>` は残し、`noscript` 要素を削除します。処理後に本文HTMLへ `noscript` が残っている場合はエラーにします。
 
 `--remove-feature-image-from-body` は互換用の非推奨エイリアスです。現在は本文画像を削除せず、`--remove-duplicate-noscript-images` と同じ挙動になります。
 
-## 出力
+## タイトル確認
 
-デフォルトでは以下を生成します。
-
-- `output/ghost-import.json`
-- `output/content/images/YYYY/MM/`
-- `output/images_manifest.csv`
-- `logs/errors.csv`
-- `fetched_urls.json`
-
-`--year YYYY` 指定時のデフォルト出力先は `outputYYYY/` です。`--diff-only` と併用した場合は `outputYYYYDiff/` へ出力します。
-
-画像はローカルへダウンロードし、本文HTML内の画像パスは `/content/images/YYYY/MM/filename.ext` 形式へ書き換えます。
-
-## 年別取得と差分出力
-
-指定年だけ取得する場合:
+タイトル候補と採用タイトルを確認したい場合:
 
 ```bash
-python ameblo_to_ghost.py \
-  --base-url "https://ameblo.jp/YOUR_AMEBLO_ID/" \
-  --year 2026 \
-  --author-id "YOUR_EXISTING_GHOST_USER_ID" \
-  --no-users \
-  --remove-duplicate-noscript-images
+python ameblo_to_ghost.py --debug-title
 ```
 
-過去に取得済みの記事を除外し、新しく見つかった記事だけを出力する場合:
+`.skinArticleTitle`、`og:title`、JSON-LD `headline`、`h1`、`soup.title` などの候補を比較し、短縮タイトルではなく最も完全そうなタイトルを採用します。
+
+## ニュースまとめリンク改善
+
+「のあれやこれや」を含むタイトルの記事では、古い記事にある行頭の `・` をMarkdown風の `- ` に変換できます。
 
 ```bash
-python ameblo_to_ghost.py \
-  --base-url "https://ameblo.jp/YOUR_AMEBLO_ID/" \
-  --year 2026 \
-  --diff-only \
-  --author-id "YOUR_EXISTING_GHOST_USER_ID" \
-  --no-users \
-  --remove-duplicate-noscript-images
+python ameblo_to_ghost.py --year 2020 --improve-news-links --remove-duplicate-noscript-images
 ```
 
-`--diff-only` は `--refresh` と併用できません。差分実行中は、`ghost-import.json` の書き出し完了後にだけ `fetched_urls.json` を更新します。中断やタイムアウトでJSONに出ていないURLだけキャッシュが進む状態を避けます。
+AmebloのOGP/リンクカードは従来どおり通常リンクへ変換します。`--improve-news-links` は、ニュースまとめ記事の古い `・リンク` 形式だけを対象にします。
 
-## page-N補完
+GhostのBookmark card化を試す場合:
 
-Amebloの月別アーカイブ `archive-YYYYMM.html` は20件で打ち切られ、古い同月記事が `page-N.html` 側にしか出ない場合があります。
+```bash
+python ameblo_to_ghost.py --year 2016 --improve-news-links --ghost-bookmark-cards --remove-duplicate-noscript-images
+```
 
-このツールは、`archive-YYYYMM.html` で指定年月の記事URLがちょうど20件見つかった月だけ、取得済みの指定年月記事URLをアンカーとして `page-N.html` を軽量探索します。アンカーが含まれるページが見つかったら、その周辺 `N-2` から `N+2` だけを補完候補にします。
-
-探索段階では本文をparseせず、一覧HTML内のリンクだけを見ます。候補記事は本文解析後に `published_at` で年/月を確認し、指定範囲外の記事は出力しません。
+`--ghost-bookmark-cards` は実験用です。Ghost Export JSONから確認した `type: "bookmark"` のLexicalノード形式で、到達確認できたニュースリンク/OGPカードをBookmark cardとして出力します。Bookmark化した記事は `posts[].lexical` 側に段落ノードとBookmarkノードだけを出し、同じリンクを `posts[].html` に二重出力しません。通常本文をLexical内のHTMLブロックとして入れないため、Ghostエディタ上に不要な `<>` HTMLブロックが出ない構成です。
 
 ## Ghost Import JSON
 
-生成するJSONはGhost 5.x Import JSONを前提にしています。
+生成するJSONは次の方針です。
 
-- `posts`
-- `tags`
-- `posts_tags`
-- `posts_authors`
-- `users` はデフォルトで出力
-- `--no-users` 指定時は `users` を出力しない
-
-記事には以下を設定します。
-
-- `status`: `published`
-- `visibility`: `public`
-- `primary_author_id`: `--author-id`
-- `posts_authors[].author_id`: `--author-id`
-- `feature_image`: 本文中の通常画像を優先
-- `custom_excerpt`: 空文字列。Amebloテーマ名はGhostタグとして扱う
-- `canonical_url`: 元記事URL
+- Ghost 5.x Import JSON を前提に `posts`, `tags`, `posts_tags`, `posts_authors` を出力
+- デフォルトでは `--author-id`, `--author-name`, `--author-slug`, `--author-email` の値で `users` を1件作成
+- `--no-users` 指定時は `data.users` を出力せず、`--author-id` の既存GhostユーザーIDを `posts[].primary_author_id` と `posts_authors[].author_id` に設定
+- `users[].id` / `posts[].primary_author_id` / `posts_authors[].author_id` は固定IDを使用し、Importごとに変わらない
+- すべての記事を `posts_authors` で指定authorに紐付け
+- `posts[].primary_author_id` に指定author id を設定
+- `posts[].html` にはAmeblo記事全体ではなく本文領域のみを保存
+- 本文抽出は `#entryBody`, `.articleText`, `[data-uranus-component="entryBody"]`, `.skin-entryBody`, `.entryBody`, `.entry-body` を優先
+- `article`, `.js-entryWrapper`, `.skinArticle` 全体やAmeblo側の記事タイトル・記事ヘッダーは本文HTMLに含めない
+- `posts[].html` 内の画像パスは `/content/images/YYYY/MM/filename.ext`
+- 通常は `mobiledoc` と `lexical` は出力しない
+- `--ghost-bookmark-cards` 指定時のみ、Bookmark card化できた記事に `posts[].lexical` を出力する
+- Ghost画像カードやMobiledoc/Lexicalのimageノードは生成せず、本文HTML内の通常の `<img>` だけを利用
 - AmebloのOGP/リンクカードは削除せず、カード内URLを通常のテキストリンクへ変換
-
-タグは以下の順で紐付けます。
-
-1. Amebloテーマをprimary tagとして `sort_order = 0`
-2. Ameblo hashtag API由来タグ
-3. HTML内から検出できたハッシュタグ
-
-タグslugとpost slugは決定論的に生成します。同じ入力なら複数回実行しても同じslugになります。
-
-## Ameblo Hashtag API
-
-Amebloのハッシュタグは記事HTMLに含まれない場合があるため、次のAPIも使います。
-
-```text
-https://rapi.blogtag.ameba.jp/hashtag/api/v2/article/tag/{blog_id}/{article_id}
-```
-
-`blog_id` は `--base-url` から、`article_id` は `entry-xxxxxxxx.html` から抽出します。
+- `posts[].status` は `published`
+- `posts[].visibility` は `public`
+- `posts[].published_at` は Ameblo の投稿日をISO形式で保存
+- `posts[].feature_image` は本文中の通常画像を優先し、`/content/images/YYYY/MM/filename.ext` 形式で保存。画像がない場合は `null`
+- `posts[].custom_excerpt` は空文字列。Amebloテーマ名はGhostタグとして扱う
+- `posts[].canonical_url` に元記事URLを保存
+- Amebloのテーマ名を Ghost の primary tag として必ず先頭に紐付け、`posts_tags.sort_order` は `0` にする
+- Amebloハッシュタグは記事HTML内の候補に加えて `https://rapi.blogtag.ameba.jp/hashtag/api/v2/article/tag/{blog_id}/{article_id}` から取得し、テーマの後ろに追加tagsとして紐付ける
+- Amebloテーマは `theme-\d+.html` または発見済みのテーマURLセットだけを正とし、月別/年別アーカイブはタグ化しない
+- インポート日時を表すタグは生成しない
+- `tags[].slug` はタグ名から決定論的に生成し、Importごとに安定
+- `posts[].slug` も記事URLまたはタイトルから決定論的に生成し、ランダム値は使わない
+- 日本語タグでASCII slugを作れない場合は `ameblo-theme-<hash>` 形式の安定slugを使用
+- `--remove-duplicate-noscript-images` 指定時は、Ameblo画像ブロック内の重複表示原因になる `noscript` を削除し、通常の本文 `<img>` と `posts[].feature_image` は維持する
+- `--improve-news-links` 指定時は、「のあれやこれや」記事の行頭 `・` を `- ` に変換する
+- `--ghost-bookmark-cards` 指定時は、到達確認できたニュースリンク/OGPカードをGhost Lexical Bookmark cardへ変換する。Bookmark化した記事では `posts[].html` を空にし、同一リンクのHTML/lexical二重出力を避ける
+- 本文末尾に `<hr>` と元記事リンクを自動付加
 
 ## 注意
 
-- 公開記事のみを対象にしています。
+- robots.txt と Ameba利用規約に配慮し、短時間に大量アクセスしないでください。
 - コメントは取得しません。
-- robots.txt とAmeba利用規約に配慮し、短時間に大量アクセスしないでください。
-- デフォルトで1〜3秒のアクセス間隔を入れています。
-- 通信失敗時は `429`, `500`, `502`, `503`, `504` を対象に自動リトライします。
-- それでも失敗したURLや画像は `logs/errors.csv` に記録します。
-- 生成するソースコードとREADMEはLF改行を前提にしています。
-
-## History
-
-### Ver. 1.5.0
-
-#### Amebloの月別アーカイブ (archive-YYYYMM.html) は、記事が20件を超える月でも20件しか返さない場合があることを確認しました。
-
-#### 実際に2020年12月の記事移行時、月別アーカイブから取得できなかった記事が複数存在し、それらは通常の時系列ページ (page-N.html) にのみ掲載されていました。
-
-#### この問題に対応するため、以下を実装しました。
-- archive-YYYYMM.html が20件ちょうどの場合のみ補完探索を実施
-- 既知記事URLをアンカーとして page-N を探索
-- アンカーを含むページ周辺のみ補完対象とする軽量探索方式を採用
-- --max-page-scan オプションを追加
-- --diff-only 実行時の fetched_urls.json 更新タイミングを改善
-
-#### 実運用で確認した事例
-- 2020年12月: 6記事を追加発見
-- 2023年4月: 1記事を追加発見
-- 2016年の記事が page-200 以降に存在するケースを確認
-
-#### そのため、Amebloから完全移行を行う場合は、年別取得時の page-N 補完機能を有効にすることを推奨します。
-
-## 個人情報の扱い
-
-このGitHubリリース用ファイルでは、以下の実値はプレースホルダー化されています。
-
-- Amebloアカウント名
-- AmebloブログURL
-- Ghost user id
-- Ghost author name
-- Ghost author slug
-- Ghost author email
-
-公開前に `fetched_urls.json`, `output/`, `logs/`, `work/` などの生成物を含めないようにしてください。
+- 広告やサイドバーは後工程で消す前提のため、本文候補領域はできるだけ保持します。
+- AmebloのHTML構造が変わると、セレクタ調整が必要になる場合があります。
