@@ -716,22 +716,35 @@ class AmebloExporter:
         response.encoding = response.apparent_encoding or response.encoding
         return BeautifulSoup(response.text, "lxml")
 
-    def is_reachable_url(self, url: str) -> bool:
+    def bookmark_url_status(self, url: str) -> tuple[bool, str | None, str | None]:
         if not hasattr(self, "_reachable_url_cache"):
             self._reachable_url_cache = {}
-        cache: dict[str, bool] = self._reachable_url_cache
+        cache: dict[str, tuple[bool, str | None, str | None]] = self._reachable_url_cache
         if url in cache:
             return cache[url]
+        reachable = False
+        final_url = None
+        reason = None
         try:
             response = self.session.head(url, timeout=self.config.timeout, allow_redirects=True)
             if response.status_code in {403, 405} or response.status_code >= 400:
                 response = self.session.get(url, timeout=self.config.timeout, allow_redirects=True, stream=True)
+            final_url = response.url
             reachable = 200 <= response.status_code < 400
+            if reachable and not is_same_redirect_domain(url, final_url):
+                reachable = False
+                reason = "redirected_to_different_domain"
+            elif not reachable:
+                reason = f"http_status_{response.status_code}"
             response.close()
-        except requests.RequestException:
+        except requests.RequestException as exc:
             reachable = False
-        cache[url] = reachable
-        return reachable
+            reason = type(exc).__name__
+        cache[url] = (reachable, final_url, reason)
+        return cache[url]
+
+    def is_reachable_url(self, url: str) -> bool:
+        return self.bookmark_url_status(url)[0]
 
     def fetch_bookmark_metadata(self, url: str, fallback_title: str = "") -> dict:
         if not hasattr(self, "_bookmark_metadata_cache"):
@@ -745,6 +758,10 @@ class AmebloExporter:
             response.raise_for_status()
             response.encoding = response.apparent_encoding or response.encoding
         except Exception:  # noqa: BLE001
+            cache[url] = metadata
+            return metadata
+        if not is_same_redirect_domain(url, response.url):
+            response.close()
             cache[url] = metadata
             return metadata
         soup = BeautifulSoup(response.text, "lxml")
@@ -1389,9 +1406,13 @@ def convert_ogp_cards_to_bookmark_placeholders(body: Tag, exporter: "AmebloExpor
         title = extract_ogp_card_title_or_none(card, href)
         if not title:
             warnings.append(f"could not bookmark OGP card: missing title: {href}")
+            card.replace_with(make_link_paragraph(href, href))
             continue
-        if not exporter.is_reachable_url(href):
-            warnings.append(f"could not bookmark OGP card: unreachable url: {href}")
+        reachable, final_url, reason = exporter.bookmark_url_status(href)
+        if not reachable:
+            destination = f" -> {final_url}" if final_url and final_url != href else ""
+            warnings.append(f"could not bookmark OGP card: {reason or 'unreachable'}: {href}{destination}")
+            card.replace_with(make_link_paragraph(href, title))
             continue
         metadata = extract_ogp_card_metadata(card, href, title)
         card.replace_with(make_bookmark_placeholder(href, metadata))
@@ -1412,8 +1433,10 @@ def convert_standalone_links_to_bookmark_placeholders(body: Tag, exporter: "Ameb
             continue
         if paragraph_text and paragraph_text != title:
             continue
-        if not exporter.is_reachable_url(href):
-            warnings.append(f"could not bookmark link: unreachable url: {href}")
+        reachable, final_url, reason = exporter.bookmark_url_status(href)
+        if not reachable:
+            destination = f" -> {final_url}" if final_url and final_url != href else ""
+            warnings.append(f"could not bookmark link: {reason or 'unreachable'}: {href}{destination}")
             continue
         paragraph.replace_with(make_bookmark_placeholder(href, exporter.fetch_bookmark_metadata(href, title)))
     return warnings
@@ -1428,6 +1451,19 @@ def is_bookmarkable_href(href: str) -> bool:
     if IMAGE_EXT_RE.search(parsed.path):
         return False
     return True
+
+
+def is_same_redirect_domain(original_url: str, final_url: str | None) -> bool:
+    original_host = normalized_hostname(original_url)
+    final_host = normalized_hostname(final_url or "")
+    return bool(original_host and final_host and original_host == final_host)
+
+
+def normalized_hostname(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower().strip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host
 
 
 def make_bookmark_placeholder(href: str, metadata: dict) -> Tag:

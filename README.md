@@ -158,6 +158,8 @@ python ameblo_to_ghost.py --year 2026 --ghost-bookmark-cards --remove-duplicate-
 
 リンク先タイトルを取得できない場合やURLへ到達できない場合は、無理にBookmark card化せず、元の通常リンクとして保持します。
 
+リンク先が閉鎖済みでドメイン売買ページなど別ドメインへリダイレクトされる場合も、Bookmark card化しません。その場合は元の記事タイトルと元リンクURLを使った通常リンクとして保持します。
+
 ## Ghost Import JSON
 
 生成するJSONは次の方針です。
@@ -190,7 +192,7 @@ python ameblo_to_ghost.py --year 2026 --ghost-bookmark-cards --remove-duplicate-
 - `posts[].slug` も記事URLまたはタイトルから決定論的に生成し、ランダム値は使わない
 - 日本語タグでASCII slugを作れない場合は `ameblo-theme-<hash>` 形式の安定slugを使用
 - `--remove-duplicate-noscript-images` 指定時は、Ameblo画像ブロック内の重複表示原因になる `noscript` を削除し、通常の本文 `<img>` と `posts[].feature_image` は維持する
-- `--ghost-bookmark-cards` 指定時は、到達確認できたURLリンク/OGPカードをGhost Lexical Bookmark cardへ変換する。Bookmark化した記事では `posts[].html` を空にし、同一リンクのHTML/lexical二重出力を避ける
+- `--ghost-bookmark-cards` 指定時は、到達確認でき、最終リダイレクト先が同一ドメインのURLリンク/OGPカードをGhost Lexical Bookmark cardへ変換する。Bookmark化した記事では `posts[].html` を空にし、同一リンクのHTML/lexical二重出力を避ける
 - 本文末尾に `<hr>` と元記事リンクを自動付加
 
 ## 注意
