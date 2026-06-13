@@ -76,7 +76,6 @@ class ExportConfig:
     diff_only: bool
     remove_feature_image_from_body: bool
     remove_duplicate_noscript_images: bool
-    improve_news_links: bool
     ghost_bookmark_cards: bool
     debug_title: bool
     year: int | None
@@ -657,10 +656,8 @@ class AmebloExporter:
         warnings = remove_image_card_blocks(body, convert_ogp_cards=not self.config.ghost_bookmark_cards)
         for warning in warnings:
             self.log_error(url, "warning", warning)
-        if self.config.improve_news_links:
-            improve_news_digest_links(body, title)
         if self.config.ghost_bookmark_cards:
-            for warning in convert_reachable_links_to_bookmark_placeholders(body, title, self):
+            for warning in convert_reachable_links_to_bookmark_placeholders(body, self):
                 self.log_error(url, "warning", warning)
         api_hashtags = self.fetch_hashtags_from_api(url)
         hashtags = merge_unique(api_hashtags, self.extract_hashtags(soup))
@@ -1367,13 +1364,10 @@ def remove_image_card_blocks(body: Tag, convert_ogp_cards: bool = True) -> list[
     return warnings
 
 
-def convert_reachable_links_to_bookmark_placeholders(
-    body: Tag, title: str, exporter: "AmebloExporter"
-) -> list[str]:
+def convert_reachable_links_to_bookmark_placeholders(body: Tag, exporter: "AmebloExporter") -> list[str]:
     warnings: list[str] = []
     warnings.extend(convert_ogp_cards_to_bookmark_placeholders(body, exporter))
-    if is_news_digest_title(title):
-        warnings.extend(convert_news_digest_links_to_bookmark_placeholders(body, exporter))
+    warnings.extend(convert_standalone_links_to_bookmark_placeholders(body, exporter))
     prune_duplicate_consecutive_links(body)
     return warnings
 
@@ -1404,68 +1398,36 @@ def convert_ogp_cards_to_bookmark_placeholders(body: Tag, exporter: "AmebloExpor
     return warnings
 
 
-def convert_news_digest_links_to_bookmark_placeholders(body: Tag, exporter: "AmebloExporter") -> list[str]:
+def convert_standalone_links_to_bookmark_placeholders(body: Tag, exporter: "AmebloExporter") -> list[str]:
     warnings: list[str] = []
     for paragraph in list(body.find_all("p")):
-        direct_text = "".join(str(text) for text in paragraph.find_all(string=True, recursive=False)).lstrip()
-        if not direct_text.startswith("-"):
-            continue
         anchors = paragraph.find_all("a", href=True)
         if len(anchors) != 1:
             continue
         anchor = anchors[0]
         href = str(anchor.get("href") or "").strip()
         title = clean_text(anchor.get_text(" ", strip=True))
-        if not href or not title:
-            warnings.append("could not bookmark news link: missing href or title")
+        paragraph_text = clean_text(paragraph.get_text(" ", strip=True))
+        if not is_bookmarkable_href(href) or not title:
+            continue
+        if paragraph_text and paragraph_text != title:
             continue
         if not exporter.is_reachable_url(href):
-            warnings.append(f"could not bookmark news link: unreachable url: {href}")
+            warnings.append(f"could not bookmark link: unreachable url: {href}")
             continue
         paragraph.replace_with(make_bookmark_placeholder(href, exporter.fetch_bookmark_metadata(href, title)))
-    warnings.extend(convert_bare_news_digest_links_to_bookmark_placeholders(body, exporter))
     return warnings
 
 
-def convert_bare_news_digest_links_to_bookmark_placeholders(body: Tag, exporter: "AmebloExporter") -> list[str]:
-    warnings: list[str] = []
-    for anchor in list(body.find_all("a", href=True)):
-        if anchor.find_parent(attrs={"data-ghost-bookmark-url": True}):
-            continue
-        previous_text = previous_text_sibling(anchor)
-        if not previous_text or not text_ends_with_dash_marker(str(previous_text)):
-            continue
-        href = str(anchor.get("href") or "").strip()
-        title = clean_text(anchor.get_text(" ", strip=True))
-        if not href or not title:
-            warnings.append("could not bookmark bare news link: missing href or title")
-            continue
-        if not exporter.is_reachable_url(href):
-            warnings.append(f"could not bookmark bare news link: unreachable url: {href}")
-            continue
-        previous_text.replace_with(NavigableString(remove_trailing_dash_marker(str(previous_text))))
-        anchor.replace_with(make_bookmark_placeholder(href, exporter.fetch_bookmark_metadata(href, title)))
-    return warnings
-
-
-def previous_text_sibling(node: Tag) -> NavigableString | None:
-    sibling = node.previous_sibling
-    while sibling is not None:
-        if isinstance(sibling, NavigableString):
-            if str(sibling).strip():
-                return sibling
-        elif isinstance(sibling, Tag) and sibling.name != "br":
-            return None
-        sibling = sibling.previous_sibling
-    return None
-
-
-def text_ends_with_dash_marker(value: str) -> bool:
-    return bool(re.search(r"(^|[\r\n])\s*-\s*$", value))
-
-
-def remove_trailing_dash_marker(value: str) -> str:
-    return re.sub(r"(^|[\r\n])(\s*)-\s*$", r"\1\2", value, count=1)
+def is_bookmarkable_href(href: str) -> bool:
+    if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+        return False
+    parsed = urlparse(href)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if IMAGE_EXT_RE.search(parsed.path):
+        return False
+    return True
 
 
 def make_bookmark_placeholder(href: str, metadata: dict) -> Tag:
@@ -1880,39 +1842,6 @@ def extract_listing_month_markers(soup: BeautifulSoup) -> set[tuple[int, int]]:
             if 1 <= month <= 12:
                 months.add((year, month))
     return months
-
-
-def improve_news_digest_links(body: Tag, title: str) -> None:
-    if not is_news_digest_title(title):
-        return
-    replace_line_initial_japanese_bullets(body)
-    for node in body.find_all(["p", "div"]):
-        replace_leading_japanese_bullet(node)
-
-
-def is_news_digest_title(title: str) -> bool:
-    return "のあれやこれや" in clean_text(title)
-
-
-def replace_leading_japanese_bullet(node: Tag) -> None:
-    for descendant in node.descendants:
-        if not isinstance(descendant, NavigableString):
-            continue
-        text = str(descendant)
-        if not text.strip():
-            continue
-        replaced = re.sub(r"^(\s*)・\s*", r"\1- ", text, count=1)
-        if replaced != text:
-            descendant.replace_with(NavigableString(replaced))
-        return
-
-
-def replace_line_initial_japanese_bullets(body: Tag) -> None:
-    for text_node in list(body.find_all(string=True)):
-        text = str(text_node)
-        replaced = re.sub(r"(^|[\r\n])(\s*)・\s*", r"\1\2- ", text)
-        if replaced != text:
-            text_node.replace_with(NavigableString(replaced))
 
 
 def remove_article_chrome(body: Tag) -> None:
@@ -2392,15 +2321,10 @@ def parse_args() -> argparse.Namespace:
         help="Remove Ameblo noscript image duplicates while keeping normal body img tags.",
     )
     parser.add_argument(
-        "--improve-news-links",
-        action="store_true",
-        help="For news digest posts, convert leading Japanese link bullets from ・ to -.",
-    )
-    parser.add_argument(
         "--ghost-bookmark-cards",
         action="store_true",
         help=(
-            "Convert eligible news/OGP links to Ghost Lexical bookmark nodes. "
+            "Convert eligible standalone URL/OGP links to Ghost Lexical bookmark nodes. "
             "Posts with bookmark nodes are emitted through posts[].lexical only."
         ),
     )
@@ -2465,7 +2389,6 @@ def main() -> None:
         remove_duplicate_noscript_images=(
             args.remove_duplicate_noscript_images or args.remove_feature_image_from_body
         ),
-        improve_news_links=args.improve_news_links,
         ghost_bookmark_cards=args.ghost_bookmark_cards,
         debug_title=args.debug_title,
         year=args.year,

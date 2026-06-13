@@ -42,12 +42,6 @@ fetched_urls.json
 python ameblo_to_ghost.py --full
 ```
 
-別ブログを対象にする場合:
-
-```bash
-python ameblo_to_ghost.py --base-url https://ameblo.jp/YOUR_AMEBLO_ID/ --full
-```
-
 アクセス間隔はデフォルトで1〜3秒です。変更する場合:
 
 ```bash
@@ -87,7 +81,7 @@ python ameblo_to_ghost.py --year 2026 --output-dir output2026Retry --remove-dupl
 既存Ghostユーザーへ紐付け、`data.users` をImport JSONに含めない場合:
 
 ```bash
-python ameblo_to_ghost.py --year 2026 --remove-duplicate-noscript-images --author-id REPLACE_WITH_EXISTING_GHOST_AUTHOR_ID --no-users
+python ameblo_to_ghost.py --year 2026 --remove-duplicate-noscript-images --no-users
 ```
 
 特定月だけ取得する場合:
@@ -152,23 +146,17 @@ python ameblo_to_ghost.py --debug-title
 
 `.skinArticleTitle`、`og:title`、JSON-LD `headline`、`h1`、`soup.title` などの候補を比較し、短縮タイトルではなく最も完全そうなタイトルを採用します。
 
-## ニュースまとめリンク改善
+## Ghost Bookmark Card変換
 
-「のあれやこれや」を含むタイトルの記事では、古い記事にある行頭の `・` をMarkdown風の `- ` に変換できます。
-
-```bash
-python ameblo_to_ghost.py --year 2020 --improve-news-links --remove-duplicate-noscript-images
-```
-
-AmebloのOGP/リンクカードは従来どおり通常リンクへ変換します。`--improve-news-links` は、ニュースまとめ記事の古い `・リンク` 形式だけを対象にします。
-
-GhostのBookmark card化を試す場合:
+AmebloのOGP/リンクカードや、本文中で単独段落として置かれているURLリンクを、GhostのBookmark cardとして出力できます。
 
 ```bash
-python ameblo_to_ghost.py --year 2016 --improve-news-links --ghost-bookmark-cards --remove-duplicate-noscript-images
+python ameblo_to_ghost.py --year 2026 --ghost-bookmark-cards --remove-duplicate-noscript-images
 ```
 
-`--ghost-bookmark-cards` は実験用です。Ghost Export JSONから確認した `type: "bookmark"` のLexicalノード形式で、到達確認できたニュースリンク/OGPカードをBookmark cardとして出力します。Bookmark化した記事は `posts[].lexical` 側に段落ノードとBookmarkノードだけを出し、同じリンクを `posts[].html` に二重出力しません。通常本文をLexical内のHTMLブロックとして入れないため、Ghostエディタ上に不要な `<>` HTMLブロックが出ない構成です。
+`--ghost-bookmark-cards` は、Ghost Export JSONから確認した `type: "bookmark"` のLexicalノード形式で、到達確認できたURLリンク/OGPカードをBookmark cardとして出力します。Bookmark化した記事は `posts[].lexical` 側に段落ノードとBookmarkノードだけを出し、同じリンクを `posts[].html` に二重出力しません。通常本文をLexical内のHTMLブロックとして入れないため、Ghostエディタ上に不要な `<>` HTMLブロックが出ない構成です。
+
+リンク先タイトルを取得できない場合やURLへ到達できない場合は、無理にBookmark card化せず、元の通常リンクとして保持します。
 
 ## Ghost Import JSON
 
@@ -202,8 +190,7 @@ python ameblo_to_ghost.py --year 2016 --improve-news-links --ghost-bookmark-card
 - `posts[].slug` も記事URLまたはタイトルから決定論的に生成し、ランダム値は使わない
 - 日本語タグでASCII slugを作れない場合は `ameblo-theme-<hash>` 形式の安定slugを使用
 - `--remove-duplicate-noscript-images` 指定時は、Ameblo画像ブロック内の重複表示原因になる `noscript` を削除し、通常の本文 `<img>` と `posts[].feature_image` は維持する
-- `--improve-news-links` 指定時は、「のあれやこれや」記事の行頭 `・` を `- ` に変換する
-- `--ghost-bookmark-cards` 指定時は、到達確認できたニュースリンク/OGPカードをGhost Lexical Bookmark cardへ変換する。Bookmark化した記事では `posts[].html` を空にし、同一リンクのHTML/lexical二重出力を避ける
+- `--ghost-bookmark-cards` 指定時は、到達確認できたURLリンク/OGPカードをGhost Lexical Bookmark cardへ変換する。Bookmark化した記事では `posts[].html` を空にし、同一リンクのHTML/lexical二重出力を避ける
 - 本文末尾に `<hr>` と元記事リンクを自動付加
 
 ## 注意
